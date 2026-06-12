@@ -17,12 +17,12 @@ Approximate cost: **~$200-250 USD per camera**
 | 5 | Storage | 32 GB microSD card | $10 | Any brand, the faster, the better. | For OS and photo storage. |
 | 6 | Push Button | 12mm Stainless Steel Push Button | $6 | [Amazon](https://www.amazon.com/dp/B0811QKG1R) | Used as a combined hardware on/off + shutter button. |
 | 7 | Camera Cable | Short Pi ribbon cable | $6 | [Amazon](https://www.amazon.com/dp/B085RW9K13?th=1) | For neatness; can also use the one that comes with the camera. |
-| 8 | Metal Screws | M2.5 Hex Standoff Spacers Kit | $10 | [Amazon](https://www.amazon.com/COMRUN-M2-5-Standoff-Assortment-Motherboard/dp/B0CKBWQSNY/) | Used for the metal screws and on the front of the case. |
-| 9 | Camera Screws | M2 screws | - | - | For mounting the camera module to the enclosure. |
-| 10 | Nylon Spacers | M2.5 nylon spacers | - | - | Hold the build together. The camera needs 4x XXmm spacers; could be nylon or metal. |
-| 11 | USB C Breakout | USB C Breakout Board | $8 | [Amazon](https://www.amazon.com/Breakout-Connector-Serial-Female-Adapter/dp/B0F2S1K5X8) | Used for external USB-C port access. |
+| 8 | Nylon Standoffs | M2.5 Hex Standoff Spacers Kit | $10 | [Amazon](https://www.amazon.com/COMRUN-M2-5-Standoff-Assortment-Motherboard/dp/B0CKBWQSNY/) | Hold the build together. The camera needs 4 20mm standofs; could be nylon or metal. |
+| 9 | Metal Screws | M2.5 metal screws | $10 | [Amazon](https://www.amazon.com/dp/B01N5RDAUX) | Holds the front lid + the USB-C board. Could be metal or nylon (if you want to use the ones from the link above). I went with metal for a nicer look on the front lid.  |
+| 10 | Camera Screws | M2 screws | $7 | [Amazon](https://www.amazon.com/QOOSIKICC-Assortment-Washers-Machine-Assorted/dp/B0DDY2L533/) | For mounting the camera module to the enclosure. |
+| 11 | USB C Port | USB C Breakout Board | $8 | [Amazon](https://www.amazon.com/Breakout-Connector-Serial-Female-Adapter/dp/B0F2S1K5X8) | Used for external USB-C port access. |
 | 12 | Connectors | JST 1.25mm 2-Pin Micro Connectors | $7 | [Amazon](https://www.amazon.com/dp/B013JRWCBU) | So it's easier to connect the USB-C port + power button during assembly. |
-| 13 | Filament | Transparent PLA Filament | $20 | [Amazon](https://www.amazon.com/dp/B08VRM8KZJ) | Good for reliable overhangs and fine details (PETG could also work but is more finicky). Translucent so status lights are visible under the board. The one used in my builds is the GIANTARM Clear PLA Filament. |
+| 13 | Filament | Transparent PLA Filament | $20 | [Amazon](https://www.amazon.com/dp/B08VRM8KZJ) | Good for reliable overhangs and fine details (PETG could also work but is more finicky). Translucent so status lights are visible under the board. The one used in my build is the GIANTARM Clear PLA Filament. |
 | 14 | Wrist Strap | Wrist strap | $6 | [Amazon](https://www.amazon.com/dp/B0BC8G4ZR2) | Hand strap for carrying. |
 | 15 | Putty | Sticky putty | $4 | Any brand | For holding the battery securely in place. |
 | 16 | Carry Case | Optional carry case | $12 | [Amazon](https://www.amazon.com/dp/B0DBLMKYGB) | For travel protection. This size (5.5" × 3.7" × 2.8") fits the camera well. |
@@ -155,7 +155,7 @@ Unbox the Waveshare 4" ePaper display HAT+ and prepare it for mounting. Screw on
 ![ePaper Display Front](images/build-guide/006-display-s.jpg)
 *The back of the Waveshare Spectra 6 ePaper display. The 40-pin header can't be removed.*
 
-Insert the display into the holes of the 3D printed enclosure, and secure it with the M2.5 standoffs.
+Insert the display into the holes of the 3D printed enclosure, and secure it with 4 20mm M2.5 standoffs.
 
 ![ePaper Display Back View 1](images/build-guide/008-display-x.jpg)
 *Rear side of the display showing the interface connectors.*

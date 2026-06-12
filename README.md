@@ -1,8 +1,6 @@
 # reFrame – the ePaper camera
 
-<p align="center">
-  <img src="docs/images/reframe-hero.jpg" alt="reFrame ePaper camera in hand" width="720" />
-</p>
+<img src="docs/images/reframe-hero.jpg" alt="reFrame ePaper camera in hand" width="720" />
 
 reFrame is an experimental digital camera designed to capture and display one photo at a time.
 
@@ -12,7 +10,7 @@ The photo stays on screen even after powering off. The only way to clear it is t
 
 🌐 **[reframe.camera](https://reframe.camera)**
 
-<p align="center">
+<p align="left">
   <img src="docs/images/sample-dithered-2.png" alt="Dithered photo sample" width="230" />
   <img src="docs/images/sample-dithered-1.png" alt="Dithered photo sample" width="230" />
   <img src="docs/images/sample-dithered-3.png" alt="Dithered photo sample" width="230" />
@@ -55,9 +53,7 @@ chmod +x install.sh
 
 ## Using the Camera
 
-<p align="center">
   <img src="docs/images/reframe.gif" alt="reFrame ePaper camera in action" width="720" />
-</p>
 
 reFrame is extremely minimalist by design. It has only a single button; no viewfinder, flash or zoom.
 
