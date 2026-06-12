@@ -1,0 +1,2981 @@
+#!/usr/bin/env python3
+
+import os
+import json
+import sys
+import logging
+import asyncio
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi.responses import StreamingResponse
+import aiofiles
+from fastapi.responses import FileResponse, HTMLResponse
+import httpx
+
+CAMERA_AVAILABLE = False
+
+# Constants
+BASE_PATH = os.path.dirname(os.path.realpath(__file__))
+PHOTOS_PATH = os.path.join(BASE_PATH, "photos")
+DITHERED_PHOTOS_PATH = os.path.join(BASE_PATH, "dithered_photos")
+SETTINGS_PATH = os.path.join(BASE_PATH, "settings.json")
+
+os.makedirs(PHOTOS_PATH, exist_ok=True)
+os.makedirs(DITHERED_PHOTOS_PATH, exist_ok=True)
+
+app = FastAPI(title="Reframe Dashboard", description="Control & Gallery Interface for Reframe Camera")
+
+class SettingsManager:
+    """Manages settings operations for the dashboard."""
+    
+    def __init__(self, settings_path: str = SETTINGS_PATH):
+        self.settings_path = Path(settings_path)
+        self.default_settings = {
+            "camera": {
+                "resolution": {"width": 1200, "height": 800},
+                "exposure_value": 0,
+                "sharpness": 3,
+                "autofocus_mode": 2
+            },
+            "processing": {
+                "saturation": 0.6,
+                "brightness_factor": 1.1,
+                "color_factor": 1.4,
+                "dithering_method": "floyd_steinberg",
+                "bayer_size": 4,
+                "threshold_scale": 1.0
+            },
+            "display": {
+                "auto_display": True,
+                "display_timeout": 0
+            },
+            "system": {
+                "auto_refresh_interval": 30,
+                "auto_timeout_minutes": 10,
+                "auto_timeout_enabled": True,
+                "show_dashboard_qr_on_first_network": True
+            },
+            "extensions": {
+                "arena": {
+                    "enabled": False,
+                    "channel": "",
+                    "access_token": ""
+                }
+            }
+        }
+        self._ensure_settings_file()
+    
+    def _ensure_settings_file(self):
+        """Ensure settings file exists with default values."""
+        if not self.settings_path.exists():
+            self.save_settings(self.default_settings)
+    
+    def load_settings(self) -> Dict[str, Any]:
+        """Load settings from JSON file."""
+        try:
+            with open(self.settings_path, 'r') as f:
+                settings = json.load(f)
+            # Ensure all default keys exist
+            return self._merge_with_defaults(settings)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return self.default_settings.copy()
+
+    def load_public_settings(self) -> Dict[str, Any]:
+        """Load settings safe to return to the browser."""
+        settings = self.load_settings()
+        arena_settings = settings.get("extensions", {}).get("arena", {})
+        access_token = arena_settings.get("access_token", "")
+        arena_settings["access_token"] = ""
+        arena_settings["access_token_configured"] = bool(access_token)
+        return settings
+    
+    def save_settings(self, settings: Dict[str, Any]) -> bool:
+        """Save settings to JSON file."""
+        try:
+            # Merge with existing settings to preserve structure
+            current_settings = self.load_settings()
+            settings = self._prepare_settings_for_save(current_settings, settings)
+            merged_settings = self._deep_merge(current_settings, settings)
+            
+            with open(self.settings_path, 'w') as f:
+                json.dump(merged_settings, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+            return False
+    
+    def _merge_with_defaults(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge loaded settings with defaults to ensure all keys exist."""
+        return self._deep_merge(self.default_settings.copy(), settings)
+    
+    def _deep_merge(self, default: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """Deep merge two dictionaries."""
+        result = default.copy()
+        for key, value in override.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    def _prepare_settings_for_save(self, current_settings: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply write-only extension secret semantics before merging settings."""
+        extensions = settings.get("extensions")
+        if not isinstance(extensions, dict):
+            return settings
+
+        arena_settings = extensions.get("arena")
+        if not isinstance(arena_settings, dict):
+            return settings
+
+        current_token = (
+            current_settings
+            .get("extensions", {})
+            .get("arena", {})
+            .get("access_token", "")
+        )
+        incoming_token = arena_settings.get("access_token")
+        clear_token = bool(arena_settings.pop("access_token_clear", False))
+
+        if clear_token:
+            arena_settings["access_token"] = ""
+        elif incoming_token is None or incoming_token == "":
+            arena_settings["access_token"] = current_token
+
+        arena_settings.pop("access_token_configured", None)
+        return settings
+
+    def clear_extension_secret(self, extension_id: str, secret_key: str) -> bool:
+        """Clear one stored extension secret."""
+        settings = self.load_settings()
+        extension_settings = settings.get("extensions", {}).get(extension_id)
+        if not isinstance(extension_settings, dict) or secret_key not in extension_settings:
+            return False
+        extension_settings[secret_key] = ""
+        try:
+            with open(self.settings_path, 'w') as f:
+                json.dump(settings, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Error clearing extension secret: {e}")
+            return False
+    
+    def get_camera_settings(self) -> Dict[str, Any]:
+        """Get camera-specific settings."""
+        return self.load_settings().get("camera", {})
+    
+    def get_processing_settings(self) -> Dict[str, Any]:
+        """Get processing-specific settings."""
+        return self.load_settings().get("processing", {})
+
+
+class ReframeClient:
+    """HTTP client to talk to the main reframe hardware service."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = httpx.Timeout(30.0)
+
+    async def get(self, path: str):
+        url = f"{self.base_url}{path}"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def post(self, path: str, json: Optional[Dict[str, Any]] = None):
+        url = f"{self.base_url}{path}"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(url, json=json)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def delete(self, path: str):
+        url = f"{self.base_url}{path}"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.delete(url)
+            resp.raise_for_status()
+            return resp.json()
+
+class PhotoManager:
+    """Manages photo operations for the dashboard."""
+    
+    def __init__(self):
+        self.photos_path = Path(PHOTOS_PATH)
+        self.dithered_path = Path(DITHERED_PHOTOS_PATH)
+        
+    def get_all_photos(self, page: int = 1, limit: int = 20) -> Dict[str, Any]:
+        """Get paginated list of photos with metadata."""
+        all_photos = []
+        
+        # Get all files from photos directory
+        if self.photos_path.exists():
+            for photo_file in sorted(self.photos_path.iterdir(), reverse=True):
+                if photo_file.is_file() and photo_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                    # Look for corresponding dithered version
+                    dithered_file = self.dithered_path / f"{photo_file.stem}_dithered.png"
+                    if not dithered_file.exists():
+                        dithered_file = self.dithered_path / f"{photo_file.stem}_dithered{photo_file.suffix}"
+                    if not dithered_file.exists():
+                        # Try without _dithered suffix for exact matches
+                        dithered_file = self.dithered_path / photo_file.name
+                    
+                    photo_info = {
+                        "id": photo_file.stem,
+                        "filename": photo_file.name,
+                        "original_path": f"/photos/{photo_file.name}",
+                        "dithered_path": f"/dithered/{dithered_file.name}" if dithered_file.exists() else None,
+                        "has_dithered": dithered_file.exists(),
+                        "size": photo_file.stat().st_size,
+                        "created": datetime.fromtimestamp(photo_file.stat().st_mtime).isoformat()
+                    }
+                    all_photos.append(photo_info)
+        
+        # Calculate pagination
+        total_photos = len(all_photos)
+        total_pages = (total_photos + limit - 1) // limit  # Ceiling division
+        start_index = (page - 1) * limit
+        end_index = start_index + limit
+        
+        # Get photos for current page
+        photos_page = all_photos[start_index:end_index]
+        
+        return {
+            "photos": photos_page,
+            "pagination": {
+                "current_page": page,
+                "total_pages": total_pages,
+                "total_photos": total_photos,
+                "photos_per_page": limit,
+                "has_next": page < total_pages,
+                "has_prev": page > 1
+            }
+        }
+    
+    def get_photo_info(self, photo_id: str) -> Dict:
+        """Get information about a specific photo."""
+        # Get all photos without pagination to search through them
+        all_photos_data = self.get_all_photos(page=1, limit=10000)  # Large limit to get all
+        photos = all_photos_data["photos"]
+        for photo in photos:
+            if photo["id"] == photo_id:
+                return photo
+        raise HTTPException(status_code=404, detail="Photo not found")
+
+
+class DashboardExtension:
+    """Base interface for dashboard photo extensions."""
+
+    id = ""
+    label = ""
+    action_label = ""
+    requires_dithered = True
+
+    def get_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        return settings.get("extensions", {}).get(self.id, {})
+
+    def enabled(self, settings: Dict[str, Any]) -> bool:
+        return bool(self.get_settings(settings).get("enabled", False))
+
+    def configured(self, settings: Dict[str, Any]) -> bool:
+        return self.enabled(settings)
+
+    def public_action(self, settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.configured(settings):
+            return None
+        return {
+            "id": self.id,
+            "label": self.label,
+            "action_label": self.action_label,
+            "requires_dithered": self.requires_dithered
+        }
+
+    async def run(self, photo: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class ArenaExtension(DashboardExtension):
+    """Upload dithered photos to an Are.na channel using the v3 API."""
+
+    id = "arena"
+    label = "Are.na"
+    action_label = "are.na"
+    requires_dithered = True
+    api_base = "https://api.are.na"
+    s3_public_base = "https://s3.amazonaws.com/arena_images-temp"
+    user_agent = "reFrame"
+    max_retries = 3
+    retry_delay = 2
+
+    def configured(self, settings: Dict[str, Any]) -> bool:
+        extension_settings = self.get_settings(settings)
+        return (
+            self.enabled(settings)
+            and bool(extension_settings.get("channel"))
+            and bool(extension_settings.get("access_token"))
+        )
+
+    async def run(self, photo: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+        extension_settings = self.get_settings(settings)
+        channel = str(extension_settings.get("channel", "")).strip()
+        access_token = str(extension_settings.get("access_token", "")).strip()
+        dithered_path = photo.get("dithered_path")
+
+        if not self.enabled(settings):
+            raise HTTPException(status_code=400, detail="Are.na extension is disabled")
+        if not channel:
+            raise HTTPException(status_code=400, detail="Are.na channel is not configured")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Are.na access token is not configured")
+        if not dithered_path:
+            raise HTTPException(status_code=400, detail="This photo does not have a dithered version to upload")
+        if not os.path.exists(dithered_path):
+            raise HTTPException(status_code=404, detail="Dithered photo file was not found")
+
+        filename = os.path.basename(dithered_path)
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": self.user_agent
+        }
+        timeout = httpx.Timeout(60.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                presign_resp = await self._request_with_retry(
+                    client,
+                    "post",
+                    f"{self.api_base}/v3/uploads/presign",
+                    headers=headers,
+                    json={"files": [{"filename": filename, "content_type": "image/png"}]}
+                )
+                self._raise_for_arena_error(presign_resp, "Could not create Are.na upload URL")
+                presign_data = presign_resp.json()
+                presigned_file = (presign_data.get("files") or [None])[0]
+                if not presigned_file:
+                    raise HTTPException(status_code=502, detail="Are.na did not return an upload URL")
+
+                upload_url = presigned_file.get("upload_url")
+                key = presigned_file.get("key")
+                content_type = presigned_file.get("content_type", "image/png")
+                if not upload_url or not key:
+                    raise HTTPException(status_code=502, detail="Are.na upload URL response was incomplete")
+
+                with open(dithered_path, "rb") as f:
+                    upload_resp = await client.put(
+                        upload_url,
+                        content=f.read(),
+                        headers={"Content-Type": content_type}
+                    )
+                if upload_resp.status_code >= 400:
+                    raise HTTPException(status_code=502, detail="Upload to Are.na storage failed")
+
+                s3_url = f"{self.s3_public_base}/{key}"
+                photo_id = photo.get("id", "unknown")
+                created = photo.get("created_at") or photo.get("created")
+                description = self._build_block_description(created)
+
+                block_resp = await self._request_with_retry(
+                    client,
+                    "post",
+                    f"{self.api_base}/v3/blocks",
+                    headers=headers,
+                    json={
+                        "value": s3_url,
+                        "channels": [{"id": channel}],
+                        "title": f"reFrame {photo_id}",
+                        "description": description,
+                        "metadata": {
+                            "source": "reframe",
+                            "photo_id": photo_id
+                        }
+                    }
+                )
+                self._raise_for_arena_error(block_resp, "Could not create Are.na block")
+                block = block_resp.json()
+        except HTTPException:
+            raise
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Could not reach Are.na: {e}") from e
+
+        block_id = block.get("id")
+        block_url = (
+            block.get("url")
+            or block.get("href")
+            or block.get("_links", {}).get("self", {}).get("href")
+        )
+        return {
+            "status": "success",
+            "message": "Uploaded dithered photo to Are.na",
+            "extension": self.id,
+            "block_id": block_id,
+            "url": block_url
+        }
+
+    async def _request_with_retry(self, client, method: str, url: str, **kwargs) -> httpx.Response:
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                response = await getattr(client, method)(url, **kwargs)
+            except httpx.RequestError as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay)
+                    continue
+                raise
+
+            if response.status_code == 429 and attempt < self.max_retries - 1:
+                await asyncio.sleep(self._rate_limit_wait_seconds(response))
+                continue
+
+            if response.status_code >= 500 and attempt < self.max_retries - 1:
+                await asyncio.sleep(self.retry_delay)
+                continue
+
+            return response
+
+        if last_error:
+            raise last_error
+        raise HTTPException(status_code=502, detail="Are.na request failed after retries")
+
+    def _rate_limit_wait_seconds(self, response: httpx.Response) -> int:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(1, min(60, int(float(retry_after))))
+            except ValueError:
+                pass
+
+        reset = response.headers.get("X-RateLimit-Reset")
+        if reset:
+            try:
+                return max(1, min(60, int(float(reset)) - int(time.time())))
+            except ValueError:
+                pass
+
+        return self.retry_delay
+
+    def _raise_for_arena_error(self, response: httpx.Response, fallback: str) -> None:
+        if response.status_code < 400:
+            return
+
+        detail_by_status = {
+            401: "Are.na access token is invalid or missing",
+            403: "Are.na token does not have write access or cannot post to this channel",
+            404: "Are.na channel was not found",
+            408: "Are.na request timed out",
+            429: "Are.na rate limit reached; try again later"
+        }
+        detail = detail_by_status.get(response.status_code, fallback)
+
+        try:
+            data = response.json()
+            message = data.get("details", {}).get("message") or data.get("message")
+            if message:
+                detail = f"{detail}: {message}"
+        except Exception:
+            pass
+
+        status_code = response.status_code if response.status_code in detail_by_status else 502
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    def _build_block_description(self, created) -> str:
+        description = "Dithered photo shot on [reframe.camera](https://reframe.camera)"
+        captured = self._format_captured_at(created)
+        if captured:
+            description = f"{description}\n\nCaptured on {captured}"
+        return description
+
+    def _format_captured_at(self, created) -> Optional[str]:
+        if not created:
+            return None
+
+        try:
+            if isinstance(created, (int, float)):
+                dt = datetime.fromtimestamp(created)
+            elif isinstance(created, str):
+                normalized = created.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(normalized)
+            else:
+                return str(created)
+            return dt.strftime("%B %-d, %Y at %-I:%M %p")
+        except Exception:
+            return str(created)
+
+
+class ExtensionRegistry:
+    """Registry for server-side dashboard extensions."""
+
+    def __init__(self, extensions: List[DashboardExtension]):
+        self.extensions = {extension.id: extension for extension in extensions}
+
+    def get(self, extension_id: str) -> Optional[DashboardExtension]:
+        return self.extensions.get(extension_id)
+
+    def public_actions(self, settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+        actions = []
+        for extension in self.extensions.values():
+            action = extension.public_action(settings)
+            if action:
+                actions.append(action)
+        return actions
+
+# Initialize managers
+settings_manager = SettingsManager()
+photo_manager = PhotoManager()
+extension_registry = ExtensionRegistry([ArenaExtension()])
+
+# Initialize HTTP client to the hardware service
+REFRAME_API_BASE = os.environ.get("REFRAME_API_BASE", "http://127.0.0.1:8077/api")
+reframe_client = ReframeClient(REFRAME_API_BASE)
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Serve the main dashboard interface."""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Reframe</title>
+        <style>
+            :root {
+                --primary-color: #F5F1F0;  /* background */
+                --secondary-color: #181818;             /* text and borders */
+                --tertiary-color: #F5F1F0;              /* content backgrounds */
+                --hover-color: #333;                  /* hover state color */
+            }
+            
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: serif;
+                background: var(--primary-color);
+                min-height: 100vh;
+                color: var(--secondary-color);
+            }
+            
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 40px;
+            }
+            
+            .header {
+                text-align: left;
+                margin-bottom: 60px;
+            }
+            
+            .header h1 {
+                color: var(--secondary-color);
+                font-size: 1rem;
+                font-weight: normal;
+            }
+            
+            .header p {
+                color: var(--secondary-color);
+                font-size: 1rem;
+                opacity: 0.8;
+            }
+            
+            .controls {
+                background: var(--tertiary-color);
+                padding: 40px;
+                margin-bottom: 40px;
+            }
+            
+            .button {
+                background: var(--secondary-color);
+                color: var(--tertiary-color);
+                border: none;
+                padding: 5px 10px;
+                cursor: pointer;
+                font-size: 1rem;
+                font-family: serif;
+            }
+            
+            .button:hover {
+                background: var(--hover-color);
+            }
+            
+            .gallery {
+                /* background: white; */
+                /* padding: 40px; */
+            }
+            
+            .pagination {
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                gap: 10px;
+                margin: 40px 0;
+                padding: 20px;
+            }
+            
+            .pagination-btn {
+                background: var(--tertiary-color);
+                color: var(--secondary-color);
+                border: 1px solid var(--secondary-color);
+                padding: 5px 10px;
+                cursor: pointer;
+                font-family: serif;
+                font-size: 1rem;
+                min-width: 40px;
+                text-align: center;
+            }
+            
+            .pagination-btn:hover:not(:disabled) {
+                background: var(--secondary-color);
+                color: var(--tertiary-color);
+            }
+            
+            .pagination-btn:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
+            
+            .pagination-btn.active {
+                background: var(--secondary-color);
+                color: var(--tertiary-color);
+            }
+            
+            .pagination-info {
+                font-family: serif;
+                font-size: 1rem;
+                margin: 0 20px;
+            }
+            
+            .gallery h2 {
+                margin-bottom: 40px;
+                color: var(--secondary-color);
+                border-bottom: 4px solid var(--secondary-color);
+                padding-bottom: 20px;
+                font-size: 1rem;
+                font-weight: normal;
+            }
+            
+            .photo-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 20px;
+            }
+            
+            .photo-card {
+                border: 2px solid var(--secondary-color);
+                overflow: hidden;
+                background: var(--tertiary-color);
+                position: relative;
+            }
+                        
+            .photo-image {
+                width: 100%;
+                object-fit: cover;
+                cursor: pointer;
+                display: block;
+            }
+            
+            .photo-info {
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: rgba(0, 0, 0, 0.7);
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.3s ease;
+                padding: 10px;
+            }
+            
+            .photo-card:hover .photo-info {
+                opacity: 1;
+                pointer-events: auto;
+            }
+            
+            .photo-card.active .photo-info {
+                opacity: 1;
+                pointer-events: auto;
+            }
+            
+            @media (hover: none) and (pointer: coarse) {
+                .photo-card:hover .photo-info {
+                    opacity: 0;
+                    pointer-events: none;
+                }
+                
+                .photo-card.active .photo-info {
+                    opacity: 1;
+                    pointer-events: auto;
+                }
+            }
+            
+            .photo-actions {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+                justify-content: center;
+            }
+            
+            .action-btn {
+                padding: 8px 12px;
+                font-size: 0.9rem;
+                text-decoration: none;
+                font-family: serif;
+                border: 1px solid var(--tertiary-color);
+                background: rgba(255, 255, 255, 0.9);
+                color: var(--secondary-color);
+                transition: all 0.2s ease;
+                display: inline-flex;
+                align-items: center;
+                backdrop-filter: blur(2px);
+            }
+            
+            .btn-primary {
+                background: rgba(255, 255, 255, 0.9);
+                color: var(--secondary-color);
+            }
+            
+            .btn-secondary {
+                background: rgba(255, 255, 255, 0.9);
+                color: var(--secondary-color);
+            }
+            
+            .btn-success {
+                background: rgba(255, 255, 255, 0.9);
+                color: var(--secondary-color);
+            }
+            
+            .action-btn:hover {
+                background: var(--tertiary-color);
+                color: var(--secondary-color);
+                transform: translateY(-1px);
+            }
+            
+            .loading {
+                text-align: center;
+                padding: 60px;
+                color: var(--secondary-color);
+                font-size: 1rem;
+            }
+            
+            .status-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            
+            .status-item {
+                display: flex;
+                align-items: center;
+                gap: 15px;
+                font-size: 1rem;
+            }
+            
+            .status-indicator {
+                width: 12px;
+                height: 12px;
+                background: var(--secondary-color);
+            }
+            
+            .settings-modal {
+                display: none;
+                position: fixed;
+                z-index: 1000;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 100%;
+                background-color: rgba(0,0,0,0.8);
+            }
+            
+            .settings-content {
+                background-color: var(--tertiary-color);
+                margin: 5% auto;
+                padding: 40px;
+                border: 2px solid var(--secondary-color);
+                width: 90%;
+                max-width: 800px;
+                max-height: 80vh;
+                overflow-y: auto;
+            }
+            
+            .settings-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 30px;
+                border-bottom: 2px solid var(--secondary-color);
+                padding-bottom: 20px;
+            }
+            
+            .settings-header h2 {
+                font-size: 1rem;
+                font-weight: normal;
+            }
+            
+            .close-btn {
+                background: var(--secondary-color);
+                color: var(--tertiary-color);
+                border: none;
+                padding: 10px 20px;
+                cursor: pointer;
+                font-family: serif;
+                font-size: 1rem;
+            }
+            
+            .close-btn:hover {
+                background: var(--hover-color);
+            }
+            
+            .settings-section {
+                margin-bottom: 30px;
+                border: 1px solid var(--secondary-color);
+                padding: 20px;
+            }
+            
+            .settings-section h3 {
+                font-size: 1rem;
+                margin-bottom: 20px;
+                font-weight: normal;
+                border-bottom: 1px solid var(--secondary-color);
+                padding-bottom: 10px;
+            }
+            
+            .setting-group {
+                margin-bottom: 20px;
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            }
+            
+            .setting-label {
+                font-weight: bold;
+                font-size: 0.9rem;
+                color: #666;
+            }
+            
+            .setting-input {
+                border: 1px solid var(--secondary-color);
+                padding: 8px 12px;
+                font-family: serif;
+                font-size: 1rem;
+                min-width: 100px;
+            }
+            
+            .setting-input:focus {
+                /* outline: 2px solid var(--secondary-color); */
+            }
+            
+            .setting-group > div {
+                display: flex;
+                flex-direction: column;
+                gap: 5px;
+                width: 100%;
+            }
+            
+            .setting-help {
+                font-size: 0.9rem;
+                color: #666;
+                margin-top: 5px;
+            }
+            
+            .disabled-setting {
+                opacity: 0.5;
+                pointer-events: none;
+            }
+            
+            .disabled-setting .setting-label {
+                color: #999;
+            }
+            
+            .disabled-setting .setting-input {
+                background-color: #f5f5f5;
+                color: #999;
+                cursor: not-allowed;
+            }
+            
+            #bayer-settings, #threshold-settings {
+                display: none;
+            }
+            
+            .settings-actions {
+                margin-top: 30px;
+                text-align: center;
+                border-top: 2px solid var(--secondary-color);
+                padding-top: 20px;
+            }
+            
+            .save-btn {
+                background: var(--secondary-color);
+                color: var(--tertiary-color);
+                border: none;
+                padding: 15px 30px;
+                cursor: pointer;
+                font-family: serif;
+                font-size: 1rem;
+                margin-right: 20px;
+            }
+            
+            .save-btn:hover {
+                background: var(--hover-color);
+            }
+            
+            .reset-btn {
+                background: var(--tertiary-color);
+                color: var(--secondary-color);
+                border: 1px solid var(--secondary-color);
+                padding: 15px 30px;
+                cursor: pointer;
+                font-family: serif;
+                font-size: 1rem;
+            }
+            
+            .reset-btn:hover {
+                background: var(--secondary-color);
+                color: var(--tertiary-color);
+            }
+            
+            @media (max-width: 768px) {
+                .photo-grid {
+                    grid-template-columns: 1fr;
+                }
+                
+                .header h1 {
+                    font-size: 1rem;
+                }
+                
+                .container {
+                    padding: 20px;
+                }
+                
+                .status-bar {
+                    flex-direction: row;
+                    flex-wrap: wrap;
+                    gap: 20px;
+                    text-align: center;
+                }
+                
+                .settings-content {
+                    margin: 2% auto;
+                    padding: 20px;
+                    width: 95%;
+                }
+                
+                .setting-group {
+                    flex-direction: column;
+                    align-items: flex-start;
+                }
+                
+                .setting-label {
+                    min-width: auto;
+                }
+                
+                .setting-help {
+                    margin-top: 5px;
+                }
+                
+                .pagination {
+                    flex-wrap: wrap;
+                    gap: 5px;
+                }
+                
+                .pagination-info {
+                    margin: 10px 0;
+                    width: 100%;
+                    text-align: center;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <div class="status-bar">
+                <h1>reframe.camera dashboard</h1>
+                <div class="status-item">
+                    <div class="status-indicator"></div>
+                    <span>system online</span>
+                </div>
+                <div class="status-item">
+                    <span id="battery-level">battery: --%</span>
+                </div>
+                <div class="status-item">
+                    <span id="photo-count">loading photos...</span>
+                </div>
+                <div class="status-item">
+                    <button class="button" onclick="refreshGallery()">refresh</button>
+                </div>
+                <button class="button" onclick="capturePhoto()">capture photo</button>
+                <button class="button" onclick="openSettings()">settings</button>
+            </div>
+            </div>
+            
+            <div class="gallery">
+                <div id="photo-grid" class="photo-grid">
+                    <div class="loading">loading photos...</div>
+                </div>
+                
+                <div id="pagination" class="pagination" style="display: none;">
+                    <button class="pagination-btn" id="prev-btn" onclick="changePage(currentPage - 1)">previous</button>
+                    <div id="page-numbers"></div>
+                    <div class="pagination-info">
+                        <span id="pagination-info"></span>
+                    </div>
+                    <button class="pagination-btn" id="next-btn" onclick="changePage(currentPage + 1)">next</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Settings Modal -->
+        <div id="settings-modal" class="settings-modal">
+            <div class="settings-content">
+                <div class="settings-header">
+                    <h2>settings</h2>
+                    <button class="close-btn" onclick="closeSettings()">close</button>
+                </div>
+                
+                <div class="settings-section">
+                    <h3>camera settings</h3>
+                    <div class="setting-group disabled-setting">
+                        <div>
+                            <span class="setting-label">resolution width</span>
+                            <input type="number" id="resolution-width" class="setting-input" min="100" max="4000" disabled>
+                        </div>
+                    </div>
+                    <div class="setting-group disabled-setting">
+                        <div>
+                            <span class="setting-label">resolution height</span>
+                            <input type="number" id="resolution-height" class="setting-input" min="100" max="4000" disabled>
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">exposure value</span>
+                            <input type="number" id="exposure-value" class="setting-input" step="0.25" min="-2" max="2">
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">sharpness</span>
+                            <input type="number" id="sharpness" class="setting-input" min="0" max="10">
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">autofocus mode</span>
+                            <select id="autofocus-mode" class="setting-input">
+                                <option value="0">Manual</option>
+                                <option value="1">Auto</option>
+                                <option value="2">Continuous</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="settings-section">
+                    <h3>processing settings</h3>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">saturation</span>
+                            <input type="number" id="saturation" class="setting-input" step="0.1" min="0" max="2">
+                        </div>
+                        <div class="setting-help">Blends between muted and saturated 6-color palettes; recommended 0.55–0.70 for natural tones.</div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">brightness factor</span>
+                            <input type="number" id="brightness-factor" class="setting-input" step="0.1" min="0.1" max="3">
+                        </div>
+                        <div class="setting-help">Multiplies image brightness before dithering; recommended 1.0–1.1.</div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">color factor</span>
+                            <input type="number" id="color-factor" class="setting-input" step="0.1" min="0.1" max="3">
+                        </div>
+                        <div class="setting-help">Boosts color intensity before dithering; recommended 1.1–1.3.</div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">dithering method</span>
+                            <select id="dithering-method" class="setting-input">
+                                <option value="floyd_steinberg">floyd steinberg</option>
+                                <option value="ordered">ordered (bayer)</option>
+                            </select>
+                        </div>
+                        <div class="setting-help">Floyd–Steinberg is the default; ordered is still experimental</div>
+                    </div>
+                    <div class="setting-group" id="bayer-settings">
+                        <div>
+                            <span class="setting-label">bayer matrix size</span>
+                            <select id="bayer-size" class="setting-input">
+                                <option value="2">2x2</option>
+                                <option value="4">4x4</option>
+                                <option value="8">8x8</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-group" id="threshold-settings">
+                        <div>
+                            <span class="setting-label">threshold scale</span>
+                            <input type="number" id="threshold-scale" class="setting-input" min="0.1" max="2.0" step="0.1">
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="settings-section">
+                    <h3>system settings</h3>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">auto refresh interval (seconds)</span>
+                            <input type="number" id="auto-refresh-interval" class="setting-input" min="5" max="300">
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">auto timeout enabled</span>
+                            <select id="auto-timeout-enabled" class="setting-input">
+                                <option value="true">enabled</option>
+                                <option value="false">disabled</option>
+                            </select>
+                        </div>
+                        <div class="setting-help">⚠️ Automatically shuts down the entire Raspberry Pi after inactivity to save battery. You'll need to manually power on the device to use it again.</div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">auto timeout duration (minutes)</span>
+                            <input type="number" id="auto-timeout-minutes" class="setting-input" min="1" max="60">
+                        </div>
+                        <div class="setting-help">Time of inactivity before system shuts down automatically</div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">dashboard QR on first network</span>
+                            <select id="show-dashboard-qr-on-first-network" class="setting-input">
+                                <option value="true">enabled</option>
+                                <option value="false">disabled</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <button class="button" onclick="showDashboardQr()" type="button">show dashboard QR</button>
+                    </div>
+
+                </div>
+
+                <div class="settings-section">
+                    <h3>extensions</h3>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">are.na upload</span>
+                            <select id="arena-enabled" class="setting-input">
+                                <option value="false">disabled</option>
+                                <option value="true">enabled</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">are.na channel slug or id</span>
+                            <input type="text" id="arena-channel" class="setting-input" placeholder="my-channel">
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">are.na access token</span>
+                            <input type="password" id="arena-access-token" class="setting-input" placeholder="leave blank to keep saved token">
+                        </div>
+                        <div class="setting-help" id="arena-token-status">No token configured</div>
+                    </div>
+                    <div class="setting-group">
+                        <button class="reset-btn" id="arena-clear-token-btn" onclick="clearArenaToken()" type="button">clear are.na token</button>
+                    </div>
+                </div>
+                
+                <div class="settings-actions">
+                    <button class="save-btn" onclick="saveSettings()">save settings</button>
+                    <button class="reset-btn" onclick="resetSettings()">reset to defaults</button>
+                </div>
+                
+                <div class="settings-actions" style="margin-top: 20px; border-top: 1px solid var(--secondary-color); padding-top: 20px;">
+                    <div id="download-controls" style="align-items: center; margin-bottom: 15px;">
+                        <button class="button" onclick="downloadAllPhotos()" style="padding: 12px 20px; min-width: 160px;">download all photos</button>
+                        <button class="button" onclick="abortDownload()" id="abort-btn" style="background: #d32f2f; display: none; padding: 12px 20px; min-width: 140px;">abort download</button>
+                    </div>
+                    <div id="delete-controls" style="align-items: center;">
+                        <button class="button" onclick="deleteAllPhotos()" style="background: #d32f2f; padding: 12px 20px; min-width: 160px;">delete all photos</button>
+                        <button class="button" onclick="abortDelete()" id="abort-delete-btn" style="background: #d32f2f; display: none; padding: 12px 20px; min-width: 140px;">abort deletion</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            let photos = [];
+            let pagination = {};
+            let currentPage = 1;
+            let extensionActions = [];
+            let arenaTokenShouldClear = false;
+            const photosPerPage = 12;  // Show 12 photos per page
+            
+            // Function to notify backend of user activity
+            async function notifyUserActivity() {
+                try {
+                    await fetch('/api/timeout/reset', { method: 'POST' });
+                } catch (error) {
+                    console.log('Could not notify user activity:', error);
+                }
+            }
+            
+            async function loadPhotos(page = 1) {
+                try {
+                    notifyUserActivity(); // Track gallery interaction
+                    await loadExtensionActions();
+                    const response = await fetch(`/api/photos?page=${page}&limit=${photosPerPage}`);
+                    if (!response.ok) {
+                        // Server returned an error — skip this poll, will retry
+                        console.log('Photos API returned', response.status, '— will retry');
+                        return;
+                    }
+                    const data = await response.json();
+                    photos = data.photos || [];
+                    pagination = data.pagination || {};
+                    currentPage = page;
+                    renderGallery();
+                    updatePhotoCount();
+                    renderPagination();
+                } catch (error) {
+                    console.error('Error loading photos:', error);
+                }
+            }
+
+            async function loadExtensionActions() {
+                try {
+                    const response = await fetch('/api/extensions/actions');
+                    if (!response.ok) {
+                        extensionActions = [];
+                        return;
+                    }
+                    const data = await response.json();
+                    extensionActions = data.actions || [];
+                } catch (error) {
+                    console.error('Error loading extension actions:', error);
+                    extensionActions = [];
+                }
+            }
+            
+            async function clearScreen() {
+                try {
+                    const btn = document.querySelector('button[onclick="clearScreen()"]');
+                    if (btn) btn.disabled = true;
+                    const resp = await fetch('/api/display/clear', { method: 'POST' });
+                    if (!resp.ok) throw new Error(await resp.text());
+                    const data = await resp.json();
+                    alert(data.message || 'screen cleared');
+                } catch (error) {
+                    console.error('Error clearing screen:', error);
+                    alert('failed to clear screen');
+                } finally {
+                    const btn = document.querySelector('button[onclick="clearScreen()"]');
+                    if (btn) btn.disabled = false;
+                }
+            }
+
+            function renderGallery() {
+                const grid = document.getElementById('photo-grid');
+                
+                if (photos.length === 0) {
+                    grid.innerHTML = '<div class="loading">no photos found. capture your first photo!</div>';
+                    return;
+                }
+                
+                grid.innerHTML = photos.map(photo => `
+                    <div class="photo-card" data-photo-id="${photo.id}">
+                        <img 
+                            src="${photo.dithered_path || photo.original_path}" 
+                            alt="Photo ${photo.id}"
+                            class="photo-image"
+                        />
+                        <div class="photo-info">
+                            <div class="photo-actions">
+                                <a href="${photo.original_path}" class="action-btn btn-primary" download onclick="event.stopPropagation()">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 48 48" style="margin-right: 5px;">
+                                        <path fill="currentColor" d="M26 6a2 2 0 1 0-4 0h4Zm-3.414 37.414a2 2 0 0 0 2.828 0l12.728-12.728a2 2 0 1 0-2.828-2.828L24 39.172 12.686 27.858a2 2 0 1 0-2.828 2.828l12.728 12.728ZM24 6h-2v36h4V6h-2Z"/>
+                                    </svg>
+                                    original
+                                </a>
+                                ${photo.has_dithered ? `
+                                    <a href="${photo.dithered_path}" class="action-btn btn-secondary" download onclick="event.stopPropagation()">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 48 48" style="margin-right: 5px;">
+                                            <path fill="currentColor" d="M10 28h4v4h-4v-4Zm4 4h4v4h-4v-4Z"/>
+                                            <path fill="currentColor" d="M14 32h4v4h-4v-4Zm4 4h4v4h-4v-4Zm20-8h-4v4h4v-4Zm-4 4h-4v4h4v-4Zm-4 4h-4v4h4v-4Zm-8 4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4V8Zm0-4h4v4h-4V4Z"/>
+                                        </svg>
+                                        dithered
+                                    </a>
+                                ` : ''}
+                                <button class="action-btn btn-success" onclick="event.stopPropagation(); displayPhoto('${photo.id}')">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 48 48" style="margin-right: 5px;">
+                                        <path fill="currentColor" d="M6 30h12v12H6V30Zm12-12h12v12H18V18ZM30 6h12v12H30V6Zm0 24h12v12H30V30ZM6 6h12v12H6V6Z"/>
+                                    </svg>
+                                    display
+                                </button>
+                                ${renderExtensionButtons(photo)}
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+                
+                // Add click handlers for photo cards
+                setupPhotoCardHandlers();
+            }
+
+            function renderExtensionButtons(photo) {
+                return extensionActions
+                    .filter(action => !action.requires_dithered || photo.has_dithered)
+                    .map(action => `
+                        <button class="action-btn btn-secondary" data-extension-id="${action.id}" data-photo-id="${photo.id}" onclick="event.stopPropagation(); runExtensionAction('${action.id}', '${photo.id}', this)">
+                            ${action.id === 'arena' ? `
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 48 48" style="margin-right: 5px; transform: rotate(180deg);">
+                                    <path fill="currentColor" d="M26 6a2 2 0 1 0-4 0h4Zm-3.414 37.414a2 2 0 0 0 2.828 0l12.728-12.728a2 2 0 1 0-2.828-2.828L24 39.172 12.686 27.858a2 2 0 1 0-2.828 2.828l12.728 12.728ZM24 6h-2v36h4V6h-2Z"/>
+                                </svg>
+                            ` : ''}
+                            ${action.action_label}
+                        </button>
+                    `).join('');
+            }
+            
+            function updatePhotoCount() {
+                if (pagination.total_photos !== undefined) {
+                    document.getElementById('photo-count').textContent = `${pagination.total_photos} photos`;
+                } else {
+                    document.getElementById('photo-count').textContent = `${photos.length} photos`;
+                }
+            }
+            
+            function renderPagination() {
+                const paginationDiv = document.getElementById('pagination');
+                const pageNumbersDiv = document.getElementById('page-numbers');
+                const paginationInfo = document.getElementById('pagination-info');
+                const prevBtn = document.getElementById('prev-btn');
+                const nextBtn = document.getElementById('next-btn');
+                
+                if (!pagination || pagination.total_pages <= 1) {
+                    paginationDiv.style.display = 'none';
+                    return;
+                }
+                
+                paginationDiv.style.display = 'flex';
+                
+                // Update navigation buttons
+                prevBtn.disabled = !pagination.has_prev;
+                nextBtn.disabled = !pagination.has_next;
+                
+                // Update pagination info
+                const startItem = ((currentPage - 1) * photosPerPage) + 1;
+                const endItem = Math.min(currentPage * photosPerPage, pagination.total_photos);
+                paginationInfo.textContent = `${startItem}-${endItem} of ${pagination.total_photos}`;
+                
+                // Generate page numbers
+                pageNumbersDiv.innerHTML = '';
+                const maxVisiblePages = 5;
+                let startPage = Math.max(1, currentPage - Math.floor(maxVisiblePages / 2));
+                let endPage = Math.min(pagination.total_pages, startPage + maxVisiblePages - 1);
+                
+                // Adjust start page if we're near the end
+                if (endPage - startPage + 1 < maxVisiblePages) {
+                    startPage = Math.max(1, endPage - maxVisiblePages + 1);
+                }
+                
+                // Add first page and ellipsis if needed
+                if (startPage > 1) {
+                    addPageButton(1);
+                    if (startPage > 2) {
+                        const ellipsis = document.createElement('span');
+                        ellipsis.textContent = '...';
+                        ellipsis.className = 'pagination-info';
+                        pageNumbersDiv.appendChild(ellipsis);
+                    }
+                }
+                
+                // Add visible page numbers
+                for (let i = startPage; i <= endPage; i++) {
+                    addPageButton(i);
+                }
+                
+                // Add last page and ellipsis if needed
+                if (endPage < pagination.total_pages) {
+                    if (endPage < pagination.total_pages - 1) {
+                        const ellipsis = document.createElement('span');
+                        ellipsis.textContent = '...';
+                        ellipsis.className = 'pagination-info';
+                        pageNumbersDiv.appendChild(ellipsis);
+                    }
+                    addPageButton(pagination.total_pages);
+                }
+            }
+            
+            function addPageButton(pageNum) {
+                const button = document.createElement('button');
+                button.textContent = pageNum;
+                button.className = 'pagination-btn' + (pageNum === currentPage ? ' active' : '');
+                button.onclick = () => changePage(pageNum);
+                document.getElementById('page-numbers').appendChild(button);
+            }
+            
+            function changePage(page) {
+                if (page >= 1 && page <= pagination.total_pages && page !== currentPage) {
+                    notifyUserActivity(); // Track pagination interaction
+                    loadPhotos(page);
+                }
+            }
+            
+            function setupPhotoCardHandlers() {
+                const photoCards = document.querySelectorAll('.photo-card');
+                
+                photoCards.forEach(card => {
+                    let tapTimeout;
+                    let lastTap = 0;
+                    
+                    // Handle click/tap events
+                    card.addEventListener('click', function(e) {
+                        const currentTime = new Date().getTime();
+                        const tapLength = currentTime - lastTap;
+                        
+                        // Check if this is a touch device
+                        const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+                        
+                        if (isTouchDevice) {
+                            // On mobile: first tap shows buttons, second tap (double-tap) opens photo
+                            if (tapLength < 500 && tapLength > 0) {
+                                // Double tap - open photo
+                                const photoId = card.getAttribute('data-photo-id');
+                                viewPhoto(photoId);
+                                card.classList.remove('active');
+                            } else {
+                                // Single tap - toggle buttons
+                                clearTimeout(tapTimeout);
+                                tapTimeout = setTimeout(() => {
+                                    // Remove active class from all other cards
+                                    photoCards.forEach(otherCard => {
+                                        if (otherCard !== card) {
+                                            otherCard.classList.remove('active');
+                                        }
+                                    });
+                                    // Toggle this card
+                                    card.classList.toggle('active');
+                                }, 300);
+                            }
+                            lastTap = currentTime;
+                        } else {
+                            // On desktop: single click opens photo (hover shows buttons)
+                            const photoId = card.getAttribute('data-photo-id');
+                            viewPhoto(photoId);
+                        }
+                    });
+                    
+                    // Close buttons when clicking outside on mobile
+                    document.addEventListener('click', function(e) {
+                        if (!card.contains(e.target)) {
+                            card.classList.remove('active');
+                        }
+                    });
+                });
+            }
+            
+            function formatFileSize(bytes) {
+                const units = ['B', 'KB', 'MB', 'GB'];
+                let size = bytes;
+                let unitIndex = 0;
+                
+                while (size >= 1024 && unitIndex < units.length - 1) {
+                    size /= 1024;
+                    unitIndex++;
+                }
+                
+                return `${size.toFixed(1)} ${units[unitIndex]}`;
+            }
+            
+            function formatDate(isoString) {
+                return new Date(isoString).toLocaleDateString();
+            }
+            
+            function viewPhoto(photoId) {
+                notifyUserActivity(); // Track photo viewing
+                const photo = photos.find(p => p.id === photoId);
+                if (photo) {
+                    // Show dithered version if available, otherwise show original
+                    const imageToShow = photo.has_dithered ? photo.dithered_path : photo.original_path;
+                    window.open(imageToShow, '_blank');
+                }
+            }
+            
+            async function displayPhoto(photoId) {
+                try {
+                    notifyUserActivity(); // Track display interaction
+                    const response = await fetch(`/api/display/${photoId}`, {
+                        method: 'POST'
+                    });
+                    
+                    if (response.ok) {
+                        const result = await response.json();
+                        alert(result.message);
+                    } else {
+                        const error = await response.json();
+                        alert(`Error: ${error.detail}`);
+                    }
+                } catch (error) {
+                    console.error('Error displaying photo:', error);
+                    alert('Error displaying photo');
+                }
+            }
+
+            async function showDashboardQr() {
+                try {
+                    notifyUserActivity();
+                    const response = await fetch('/api/dashboard/qr', {
+                        method: 'POST'
+                    });
+                    const result = await response.json();
+                    if (response.ok && result.success) {
+                        alert(result.message || 'Dashboard QR displayed');
+                    } else {
+                        alert(`Error: ${result.detail || result.message || 'Could not show dashboard QR'}`);
+                    }
+                } catch (error) {
+                    console.error('Error showing dashboard QR:', error);
+                    alert('Error showing dashboard QR');
+                }
+            }
+
+            async function runExtensionAction(extensionId, photoId, button) {
+                const originalText = button ? button.textContent : '';
+                try {
+                    notifyUserActivity();
+                    if (button) {
+                        button.textContent = 'uploading...';
+                        button.disabled = true;
+                    }
+
+                    const response = await fetch(`/api/extensions/${extensionId}/photos/${photoId}`, {
+                        method: 'POST'
+                    });
+                    const result = await response.json();
+
+                    if (response.ok) {
+                        alert(result.message || 'Upload complete');
+                    } else {
+                        alert(`Error: ${result.detail || 'Upload failed'}`);
+                    }
+                } catch (error) {
+                    console.error('Error running extension action:', error);
+                    alert('Error running extension action');
+                } finally {
+                    if (button) {
+                        button.textContent = originalText;
+                        button.disabled = false;
+                    }
+                }
+            }
+            
+            async function capturePhoto() {
+                try {
+                    notifyUserActivity(); // Track capture interaction
+                    // Find the capture button and show loading indicator
+                    const captureBtn = document.querySelector('button[onclick="capturePhoto()"]');
+                    if (captureBtn) {
+                        captureBtn.textContent = 'capturing...';
+                        captureBtn.disabled = true;
+                    }
+                    
+                    const response = await fetch('/api/capture', {
+                        method: 'POST'
+                    });
+                    
+                    if (response.ok) {
+                        const result = await response.json();
+                        alert(result.message);
+                        // Refresh gallery to show new photo (go to first page since new photos appear first)
+                        loadPhotos(1);
+                    } else {
+                        const error = await response.json();
+                        alert(`Error: ${error.detail}`);
+                    }
+                } catch (error) {
+                    console.error('Error capturing photo:', error);
+                    alert('Error capturing photo');
+                } finally {
+                    // Restore button state
+                    const captureBtn = document.querySelector('button[onclick="capturePhoto()"]');
+                    if (captureBtn) {
+                        captureBtn.textContent = 'capture photo';
+                        captureBtn.disabled = false;
+                    }
+                }
+            }
+            
+            async function reprocessPhoto(photoId) {
+                try {
+                    const response = await fetch(`/api/reprocess/${photoId}`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        }
+                    });
+                    
+                    if (response.ok) {
+                        const result = await response.json();
+                        alert(result.message);
+                        // Refresh gallery to show updated photo (stay on current page)
+                        loadPhotos(currentPage);
+                    } else {
+                        const error = await response.json();
+                        alert(`Error: ${error.detail}`);
+                    }
+                } catch (error) {
+                    console.error('Error reprocessing photo:', error);
+                    alert('Error reprocessing photo');
+                }
+            }
+            
+            async function openSettings() {
+                try {
+                    notifyUserActivity(); // Track settings interaction
+                    const response = await fetch('/api/settings');
+                    const settings = await response.json();
+                    populateSettingsForm(settings);
+                    document.getElementById('settings-modal').style.display = 'block';
+                } catch (error) {
+                    console.error('Error loading settings:', error);
+                    alert('Error loading settings');
+                }
+            }
+            
+            function closeSettings() {
+                document.getElementById('settings-modal').style.display = 'none';
+            }
+            
+            function populateSettingsForm(settings) {
+                // Camera settings
+                document.getElementById('resolution-width').value = settings.camera.resolution.width;
+                document.getElementById('resolution-height').value = settings.camera.resolution.height;
+                document.getElementById('exposure-value').value = settings.camera.exposure_value;
+                document.getElementById('sharpness').value = settings.camera.sharpness;
+                document.getElementById('autofocus-mode').value = settings.camera.autofocus_mode;
+                
+                // Processing settings
+                document.getElementById('saturation').value = settings.processing.saturation;
+                document.getElementById('brightness-factor').value = settings.processing.brightness_factor;
+                document.getElementById('color-factor').value = settings.processing.color_factor;
+                document.getElementById('dithering-method').value = settings.processing.dithering_method;
+                document.getElementById('bayer-size').value = settings.processing.bayer_size || 4;
+                document.getElementById('threshold-scale').value = settings.processing.threshold_scale || 1.0;
+                
+                // Show/hide ordered dithering settings
+                toggleOrderedSettings();
+                
+                // System settings
+                document.getElementById('auto-refresh-interval').value = settings.system.auto_refresh_interval;
+                document.getElementById('auto-timeout-enabled').value = settings.system.auto_timeout_enabled ? 'true' : 'false';
+                document.getElementById('auto-timeout-minutes').value = settings.system.auto_timeout_minutes || 10;
+                document.getElementById('show-dashboard-qr-on-first-network').value = settings.system.show_dashboard_qr_on_first_network !== false ? 'true' : 'false';
+
+                const arenaSettings = (settings.extensions && settings.extensions.arena) || {};
+                document.getElementById('arena-enabled').value = arenaSettings.enabled ? 'true' : 'false';
+                document.getElementById('arena-channel').value = arenaSettings.channel || '';
+                document.getElementById('arena-access-token').value = '';
+                arenaTokenShouldClear = false;
+                updateArenaTokenStatus(Boolean(arenaSettings.access_token_configured));
+            }
+
+            function updateArenaTokenStatus(configured) {
+                const status = document.getElementById('arena-token-status');
+                const clearBtn = document.getElementById('arena-clear-token-btn');
+                if (arenaTokenShouldClear) {
+                    status.textContent = 'Token will be cleared when settings are saved';
+                    clearBtn.disabled = true;
+                } else if (configured) {
+                    status.textContent = 'Token saved. Leave blank to keep it.';
+                    clearBtn.disabled = false;
+                } else {
+                    status.textContent = 'No token configured';
+                    clearBtn.disabled = true;
+                }
+            }
+
+            function clearArenaToken() {
+                arenaTokenShouldClear = true;
+                document.getElementById('arena-access-token').value = '';
+                updateArenaTokenStatus(false);
+            }
+            
+            async function saveSettings() {
+                try {
+                    const settings = {
+                        camera: {
+                            resolution: {
+                                width: parseInt(document.getElementById('resolution-width').value),
+                                height: parseInt(document.getElementById('resolution-height').value)
+                            },
+                            exposure_value: parseFloat(document.getElementById('exposure-value').value),
+                            sharpness: parseInt(document.getElementById('sharpness').value),
+                            autofocus_mode: parseInt(document.getElementById('autofocus-mode').value)
+                        },
+                        processing: {
+                            saturation: parseFloat(document.getElementById('saturation').value),
+                            brightness_factor: parseFloat(document.getElementById('brightness-factor').value),
+                            color_factor: parseFloat(document.getElementById('color-factor').value),
+                            dithering_method: document.getElementById('dithering-method').value,
+                            bayer_size: parseInt(document.getElementById('bayer-size').value),
+                            threshold_scale: parseFloat(document.getElementById('threshold-scale').value)
+                        },
+                        system: {
+                            auto_refresh_interval: parseInt(document.getElementById('auto-refresh-interval').value),
+                            auto_timeout_enabled: document.getElementById('auto-timeout-enabled').value === 'true',
+                            auto_timeout_minutes: parseInt(document.getElementById('auto-timeout-minutes').value),
+                            show_dashboard_qr_on_first_network: document.getElementById('show-dashboard-qr-on-first-network').value === 'true'
+                        },
+                        extensions: {
+                            arena: {
+                                enabled: document.getElementById('arena-enabled').value === 'true',
+                                channel: document.getElementById('arena-channel').value.trim(),
+                                access_token: document.getElementById('arena-access-token').value.trim(),
+                                access_token_clear: arenaTokenShouldClear
+                            }
+                        }
+                    };
+                    
+                    const response = await fetch('/api/settings', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(settings)
+                    });
+                    
+                    if (response.ok) {
+                        alert('Settings saved successfully!');
+                        closeSettings();
+                        // Update auto-refresh interval if changed
+                        updateAutoRefreshInterval();
+                        await loadExtensionActions();
+                        renderGallery();
+                    } else {
+                        alert('Error saving settings');
+                    }
+                } catch (error) {
+                    console.error('Error saving settings:', error);
+                    alert('Error saving settings');
+                }
+            }
+            
+            async function resetSettings() {
+                if (confirm('Are you sure you want to reset all settings to defaults?')) {
+                    try {
+                        const defaultSettings = {
+                            camera: {
+                                resolution: {width: 1200, height: 800},
+                                exposure_value: 0,
+                                sharpness: 3,
+                                autofocus_mode: 2
+                            },
+                            processing: {
+                                saturation: 0.6,
+                                brightness_factor: 1.1,
+                                color_factor: 1.4,
+                                dithering_method: "floyd_steinberg",
+                                bayer_size: 4,
+                                threshold_scale: 1.0
+                            },
+                            system: {
+                                auto_refresh_interval: 30,
+                                auto_timeout_enabled: true,
+                                auto_timeout_minutes: 10,
+                                show_dashboard_qr_on_first_network: true
+                            },
+                            extensions: {
+                                arena: {
+                                    enabled: false,
+                                    channel: "",
+                                    access_token: "",
+                                    access_token_clear: true
+                                }
+                            }
+                        };
+                        
+                        const response = await fetch('/api/settings', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify(defaultSettings)
+                        });
+                        
+                        if (response.ok) {
+                            populateSettingsForm(defaultSettings);
+                            await loadExtensionActions();
+                            renderGallery();
+                            alert('Settings reset to defaults!');
+                        } else {
+                            alert('Error resetting settings');
+                        }
+                    } catch (error) {
+                        console.error('Error resetting settings:', error);
+                        alert('Error resetting settings');
+                    }
+                }
+            }
+            
+            let autoRefreshInterval;
+            
+            function updateAutoRefreshInterval() {
+                // Clear existing interval
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                }
+                
+                // Get current auto-refresh setting
+                fetch('/api/settings')
+                    .then(response => response.json())
+                    .then(settings => {
+                        const intervalSeconds = settings.system.auto_refresh_interval;
+                        if (intervalSeconds > 0) {
+                            autoRefreshInterval = setInterval(loadPhotos, intervalSeconds * 1000);
+                        }
+                    })
+                    .catch(error => console.error('Error updating auto-refresh:', error));
+            }
+            
+            function toggleOrderedSettings() {
+                const ditheringMethod = document.getElementById('dithering-method').value;
+                const bayerSettings = document.getElementById('bayer-settings');
+                const thresholdSettings = document.getElementById('threshold-settings');
+                
+                if (ditheringMethod === 'ordered') {
+                    bayerSettings.style.display = 'block';
+                    thresholdSettings.style.display = 'block';
+                } else {
+                    bayerSettings.style.display = 'none';
+                    thresholdSettings.style.display = 'none';
+                }
+            }
+            
+            function refreshGallery() {
+                notifyUserActivity(); // Track refresh interaction
+                loadPhotos(currentPage);
+            }
+            
+            async function downloadAllPhotos() {
+                try {
+                    notifyUserActivity(); // Track download interaction
+                    
+                    // Find the download button and show loading state
+                    const downloadBtn = document.querySelector('button[onclick="downloadAllPhotos()"]');
+                    const abortBtn = document.getElementById('abort-btn');
+                    if (downloadBtn) {
+                        const originalText = downloadBtn.textContent;
+                        downloadBtn.textContent = 'starting download...';
+                        downloadBtn.disabled = true;
+                        downloadBtn.style.opacity = '0.7';
+                    }
+                    
+                    // Show abort button
+                    if (abortBtn) {
+                        abortBtn.style.display = 'inline-block';
+                    }
+                    
+                    // Start the download process
+                    const startResponse = await fetch('/api/photos/download-all/start', {
+                        method: 'POST'
+                    });
+                    
+                    if (!startResponse.ok) {
+                        const error = await startResponse.json();
+                        throw new Error(error.detail || 'Failed to start download');
+                    }
+                    
+                    const startData = await startResponse.json();
+                    const totalPhotos = startData.total_photos;
+                    
+                    // Poll for progress
+                    let attempts = 0;
+                    const maxAttempts = 600; // 5 minutes max
+                    
+                    window.progressInterval = setInterval(async () => {
+                        attempts++;
+                        
+                        try {
+                            const progressResponse = await fetch('/api/photos/download-all/progress');
+                            if (progressResponse.ok) {
+                                const progress = await progressResponse.json();
+                                
+                                if (downloadBtn) {
+                                    if (progress.status === 'creating') {
+                                        const percent = Math.round((progress.processed / progress.total) * 100);
+                                        downloadBtn.textContent = `${progress.message} (${percent}%)`;
+                                    } else if (progress.status === 'completed') {
+                                        downloadBtn.textContent = 'download ready!';
+                                        clearInterval(window.progressInterval);
+                                        window.progressInterval = null;
+                                        
+                                        // Hide abort button
+                                        if (abortBtn) {
+                                            abortBtn.style.display = 'none';
+                                        }
+                                        
+                                        // Download the file with better error handling
+                                        try {
+                                            console.log('Starting file download...');
+                                            const resultResponse = await fetch('/api/photos/download-all/result');
+                                            console.log('Download response status:', resultResponse.status);
+                                            
+                                            if (resultResponse.ok) {
+                                                const blob = await resultResponse.blob();
+                                                console.log('Blob size:', blob.size);
+                                                
+                                                const url = window.URL.createObjectURL(blob);
+                                                const a = document.createElement('a');
+                                                a.href = url;
+                                                a.download = `reframe-photos-${new Date().toISOString().split('T')[0]}.zip`;
+                                                a.style.display = 'none';
+                                                document.body.appendChild(a);
+                                                a.click();
+                                                window.URL.revokeObjectURL(url);
+                                                document.body.removeChild(a);
+                                                
+                                                console.log('Download triggered successfully');
+                                                downloadBtn.textContent = 'download complete!';
+                                                setTimeout(() => {
+                                                    if (downloadBtn) {
+                                                        downloadBtn.textContent = originalText;
+                                                        downloadBtn.disabled = false;
+                                                        downloadBtn.style.opacity = '1';
+                                                    }
+                                                }, 2000);
+                                            } else {
+                                                const errorText = await resultResponse.text();
+                                                console.error('Download failed:', resultResponse.status, errorText);
+                                                throw new Error(`Failed to download file: ${resultResponse.status}`);
+                                            }
+                                        } catch (downloadError) {
+                                            console.error('Download error:', downloadError);
+                                            throw downloadError;
+                                        }
+                                    } else if (progress.status === 'aborted') {
+                                        clearInterval(window.progressInterval);
+                                        window.progressInterval = null;
+                                        downloadBtn.textContent = 'download aborted';
+                                        setTimeout(() => {
+                                            if (downloadBtn) {
+                                                downloadBtn.textContent = originalText;
+                                                downloadBtn.disabled = false;
+                                                downloadBtn.style.opacity = '1';
+                                            }
+                                            if (abortBtn) {
+                                                abortBtn.style.display = 'none';
+                                            }
+                                        }, 2000);
+                                        return;
+                                    } else if (progress.status === 'error') {
+                                        throw new Error(progress.message);
+                                    }
+                                }
+                            } else {
+                                throw new Error('Failed to get progress');
+                            }
+                        } catch (error) {
+                            clearInterval(window.progressInterval);
+                            window.progressInterval = null;
+                            throw error;
+                        }
+                        
+                        // Timeout after max attempts
+                        if (attempts >= maxAttempts) {
+                            clearInterval(window.progressInterval);
+                            window.progressInterval = null;
+                            throw new Error('Download timed out after 5 minutes');
+                        }
+                    }, 1000); // Check progress every second
+                    
+                } catch (error) {
+                    console.error('Error downloading photos:', error);
+                    alert(`Error: ${error.message}`);
+                    
+                    // Reset button on error
+                    const downloadBtn = document.querySelector('button[onclick="downloadAllPhotos()"]');
+                    const abortBtn = document.getElementById('abort-btn');
+                    if (downloadBtn) {
+                        downloadBtn.textContent = 'download all photos';
+                        downloadBtn.disabled = false;
+                        downloadBtn.style.opacity = '1';
+                    }
+                    if (abortBtn) {
+                        abortBtn.style.display = 'none';
+                    }
+                }
+            }
+            
+            async function abortDownload() {
+                try {
+                    const response = await fetch('/api/photos/download-all/abort', {
+                        method: 'POST'
+                    });
+                    
+                    if (response.ok) {
+                        const abortBtn = document.getElementById('abort-btn');
+                        const downloadBtn = document.querySelector('button[onclick="downloadAllPhotos()"]');
+                        
+                        if (abortBtn) {
+                            abortBtn.textContent = 'aborting...';
+                            abortBtn.disabled = true;
+                        }
+                        
+                        // Clear any existing progress interval
+                        if (window.progressInterval) {
+                            clearInterval(window.progressInterval);
+                            window.progressInterval = null;
+                        }
+                        
+                        // Reset download button after a short delay
+                        setTimeout(() => {
+                            if (downloadBtn) {
+                                downloadBtn.textContent = 'download all photos';
+                                downloadBtn.disabled = false;
+                                downloadBtn.style.opacity = '1';
+                            }
+                            if (abortBtn) {
+                                abortBtn.style.display = 'none';
+                            }
+                        }, 1000);
+                        
+                    } else {
+                        alert('Failed to abort download');
+                    }
+                } catch (error) {
+                    console.error('Error aborting download:', error);
+                    alert('Error aborting download');
+                }
+            }
+            
+            async function deleteAllPhotos() {
+                const confirmed = confirm('⚠️ This will permanently delete ALL photos from the system. This action cannot be undone. Are you absolutely sure?');
+                if (!confirmed) {
+                    return;
+                }
+                
+                const doubleConfirmed = confirm('Final confirmation: Delete ALL photos? This will remove both original and dithered versions.');
+                if (!doubleConfirmed) {
+                    return;
+                }
+                
+                try {
+                    notifyUserActivity(); // Track delete interaction
+                    
+                    // Find the delete button and show loading state
+                    const deleteBtn = document.querySelector('button[onclick="deleteAllPhotos()"]');
+                    const abortDeleteBtn = document.getElementById('abort-delete-btn');
+                    if (deleteBtn) {
+                        const originalText = deleteBtn.textContent;
+                        deleteBtn.textContent = 'starting deletion...';
+                        deleteBtn.disabled = true;
+                        deleteBtn.style.opacity = '0.7';
+                    }
+                    
+                    // Show abort button
+                    if (abortDeleteBtn) {
+                        abortDeleteBtn.style.display = 'inline-block';
+                    }
+                    
+                    // Start the delete process
+                    const startResponse = await fetch('/api/photos/delete-all/start', {
+                        method: 'POST'
+                    });
+                    
+                    if (!startResponse.ok) {
+                        const error = await startResponse.json();
+                        throw new Error(error.detail || 'Failed to start deletion');
+                    }
+                    
+                    const startData = await startResponse.json();
+                    
+                    // If no photos to delete, show message and return
+                    if (startData.status === 'completed') {
+                        alert(startData.message || 'No photos to delete');
+                        if (deleteBtn) {
+                            deleteBtn.textContent = originalText;
+                            deleteBtn.disabled = false;
+                            deleteBtn.style.opacity = '1';
+                        }
+                        if (abortDeleteBtn) {
+                            abortDeleteBtn.style.display = 'none';
+                        }
+                        return;
+                    }
+                    
+                    const totalPhotos = startData.total_photos;
+                    
+                    // Poll for progress
+                    let attempts = 0;
+                    const maxAttempts = 300; // 5 minutes max
+                    
+                    window.deleteProgressInterval = setInterval(async () => {
+                        attempts++;
+                        
+                        try {
+                            const progressResponse = await fetch('/api/photos/delete-all/progress');
+                            if (progressResponse.ok) {
+                                const progress = await progressResponse.json();
+                                
+                                if (deleteBtn) {
+                                    if (progress.status === 'deleting') {
+                                        const percent = Math.round((progress.processed / progress.total) * 100);
+                                        deleteBtn.textContent = `${progress.message} (${percent}%)`;
+                                    } else if (progress.status === 'completed') {
+                                        deleteBtn.textContent = 'deletion complete!';
+                                        clearInterval(window.deleteProgressInterval);
+                                        window.deleteProgressInterval = null;
+                                        
+                                        // Hide abort button
+                                        if (abortDeleteBtn) {
+                                            abortDeleteBtn.style.display = 'none';
+                                        }
+                                        
+                                        // Show success message and refresh gallery
+                                        alert(progress.message || 'All photos deleted successfully');
+                                        loadPhotos(1);
+                                        
+                                        setTimeout(() => {
+                                            if (deleteBtn) {
+                                                deleteBtn.textContent = originalText;
+                                                deleteBtn.disabled = false;
+                                                deleteBtn.style.opacity = '1';
+                                            }
+                                        }, 2000);
+                                    } else if (progress.status === 'aborted') {
+                                        clearInterval(window.deleteProgressInterval);
+                                        window.deleteProgressInterval = null;
+                                        deleteBtn.textContent = 'deletion aborted';
+                                        setTimeout(() => {
+                                            if (deleteBtn) {
+                                                deleteBtn.textContent = originalText;
+                                                deleteBtn.disabled = false;
+                                                deleteBtn.style.opacity = '1';
+                                            }
+                                            if (abortDeleteBtn) {
+                                                abortDeleteBtn.style.display = 'none';
+                                            }
+                                        }, 2000);
+                                        return;
+                                    } else if (progress.status === 'error') {
+                                        throw new Error(progress.message);
+                                    }
+                                }
+                            } else {
+                                throw new Error('Failed to get progress');
+                            }
+                        } catch (error) {
+                            clearInterval(window.deleteProgressInterval);
+                            window.deleteProgressInterval = null;
+                            throw error;
+                        }
+                        
+                        // Timeout after max attempts
+                        if (attempts >= maxAttempts) {
+                            clearInterval(window.deleteProgressInterval);
+                            window.deleteProgressInterval = null;
+                            throw new Error('Deletion timed out after 5 minutes');
+                        }
+                    }, 1000); // Check progress every second
+                    
+                } catch (error) {
+                    console.error('Error deleting photos:', error);
+                    alert(`Error: ${error.message}`);
+                    
+                    // Reset button on error
+                    const deleteBtn = document.querySelector('button[onclick="deleteAllPhotos()"]');
+                    const abortDeleteBtn = document.getElementById('abort-delete-btn');
+                    if (deleteBtn) {
+                        deleteBtn.textContent = 'delete all photos';
+                        deleteBtn.disabled = false;
+                        deleteBtn.style.opacity = '1';
+                    }
+                    if (abortDeleteBtn) {
+                        abortDeleteBtn.style.display = 'none';
+                    }
+                }
+            }
+            
+            async function abortDelete() {
+                try {
+                    const response = await fetch('/api/photos/delete-all/abort', {
+                        method: 'POST'
+                    });
+                    
+                    if (response.ok) {
+                        const abortDeleteBtn = document.getElementById('abort-delete-btn');
+                        const deleteBtn = document.querySelector('button[onclick="deleteAllPhotos()"]');
+                        
+                        if (abortDeleteBtn) {
+                            abortDeleteBtn.textContent = 'aborting...';
+                            abortDeleteBtn.disabled = true;
+                        }
+                        
+                        // Clear any existing progress interval
+                        if (window.deleteProgressInterval) {
+                            clearInterval(window.deleteProgressInterval);
+                            window.deleteProgressInterval = null;
+                        }
+                        
+                        // Reset delete button after a short delay
+                        setTimeout(() => {
+                            if (deleteBtn) {
+                                deleteBtn.textContent = 'delete all photos';
+                                deleteBtn.disabled = false;
+                                deleteBtn.style.opacity = '1';
+                            }
+                            if (abortDeleteBtn) {
+                                abortDeleteBtn.style.display = 'none';
+                            }
+                        }, 1000);
+                        
+                    } else {
+                        alert('Failed to abort deletion');
+                    }
+                } catch (error) {
+                    console.error('Error aborting deletion:', error);
+                    alert('Error aborting deletion');
+                }
+            }
+            
+            // Load photos on page load
+            document.addEventListener('DOMContentLoaded', function() {
+                loadPhotos();
+                updateAutoRefreshInterval();
+                updateBatteryLevel();
+                
+                // Add event listener for dithering method changes
+                document.getElementById('dithering-method').addEventListener('change', toggleOrderedSettings);
+                
+                // Update battery level every 30 seconds
+                setInterval(updateBatteryLevel, 30000);
+            });
+            
+            async function updateBatteryLevel() {
+                try {
+                    const response = await fetch('/api/battery');
+                    if (response.ok) {
+                        const data = await response.json();
+                        const batteryElement = document.getElementById('battery-level');
+                        
+                        if (data.battery_level !== null && data.battery_level !== undefined) {
+                            batteryElement.textContent = `battery: ${data.battery_level}%`;
+                            
+                            // Add visual indicator based on battery level
+                            batteryElement.className = '';
+                            if (data.battery_level <= 10) {
+                                batteryElement.style.color = '#d32f2f'; // Red for low battery
+                            } else if (data.battery_level <= 25) {
+                                batteryElement.style.color = '#f57c00'; // Orange for warning
+                            } else {
+                                batteryElement.style.color = ''; // Default color
+                            }
+                        } else {
+                            batteryElement.textContent = 'battery: --%';
+                            batteryElement.style.color = '#666'; // Gray for unknown
+                        }
+                    }
+                } catch (error) {
+                    console.log('Could not fetch battery level:', error);
+                    const batteryElement = document.getElementById('battery-level');
+                    batteryElement.textContent = 'battery: --%';
+                    batteryElement.style.color = '#666';
+                }
+            }
+            
+            // Close modal when clicking outside of it
+            window.onclick = function(event) {
+                const modal = document.getElementById('settings-modal');
+                if (event.target === modal) {
+                    closeSettings();
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@app.get("/api/photos")
+async def list_photos(page: int = 1, limit: int = 20):
+    """Get paginated list of photos with metadata from the hardware service."""
+    if page < 1:
+        page = 1
+    if limit < 1 or limit > 100:
+        limit = 20
+    try:
+        # Fetch all photos from hardware service and paginate here for simplicity
+        all_photos = await reframe_client.get("/photos")
+        # Rewrite absolute file system paths to dashboard-served URLs
+        for photo in all_photos:
+            try:
+                if photo.get("original_path"):
+                    from os.path import basename as _bn
+                    orig_name = _bn(photo["original_path"])
+                    photo["original_path"] = f"/photos/{orig_name}"
+                if photo.get("dithered_path"):
+                    from os.path import basename as _bn
+                    dith_name = _bn(photo["dithered_path"])
+                    photo["dithered_path"] = f"/dithered/{dith_name}"
+            except Exception:
+                continue
+    except Exception as e:
+        logging.warning(f"Error fetching photos from hardware service: {e}")
+        all_photos = []
+    start = (page - 1) * limit
+    end = start + limit
+    total = len(all_photos)
+    total_pages = (total + limit - 1) // limit if total else 1
+    return {
+        "photos": all_photos[start:end],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total_photos": total,
+            "total_pages": total_pages,
+            "has_prev": page > 1,
+            "has_next": page < total_pages,
+        },
+    }
+
+@app.get("/api/photos/download-all")
+async def download_all_photos():
+    """Download all photos as a ZIP file."""
+    import zipfile
+    import tempfile
+    from fastapi.responses import StreamingResponse
+    import io
+    import asyncio
+    import aiofiles
+    
+    try:
+        # Get all photos from hardware service (these have absolute paths)
+        all_photos = await reframe_client.get("/photos")
+        
+        if not all_photos:
+            raise HTTPException(status_code=404, detail="No photos found")
+        
+        # Create temporary file for better performance
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
+            temp_path = temp_file.name
+        
+        # Create ZIP file with streaming
+        async def create_zip_stream():
+            with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
+                total_photos = len(all_photos)
+                processed = 0
+                
+                for photo in all_photos:
+                    try:
+                        # Add original photo - use the absolute path from hardware service
+                        if photo.get("original_path"):
+                            original_file_path = photo["original_path"]  # This is already an absolute path
+                            if os.path.exists(original_file_path):
+                                # Get just the filename for the ZIP
+                                from os.path import basename
+                                filename = basename(original_file_path)
+                                zip_file.write(original_file_path, f"original/{filename}")
+                        
+                        # Add dithered photo if available - use the absolute path from hardware service
+                        if photo.get("dithered_path"):
+                            dithered_file_path = photo["dithered_path"]  # This is already an absolute path
+                            if os.path.exists(dithered_file_path):
+                                # Get just the filename for the ZIP
+                                from os.path import basename
+                                filename = basename(dithered_file_path)
+                                zip_file.write(dithered_file_path, f"dithered/{filename}")
+                        
+                        processed += 1
+                        
+                        # Yield control more frequently for better responsiveness
+                        if processed % 2 == 0:
+                            await asyncio.sleep(0.005)  # Even smaller delay
+                                
+                    except Exception as e:
+                        print(f"Error adding photo {photo.get('id', 'unknown')} to ZIP: {e}")
+                        processed += 1
+                        continue
+        
+        # Create ZIP in background
+        await create_zip_stream()
+        
+        # Stream the file back
+        async def file_stream():
+            async with aiofiles.open(temp_path, 'rb') as f:
+                while chunk := await f.read(8192):  # 8KB chunks
+                    yield chunk
+            
+            # Clean up temp file
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+        
+        # Return streaming response
+        return StreamingResponse(
+            file_stream(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename=reframe-photos-{datetime.now().strftime('%Y%m%d')}.zip"}
+        )
+        
+    except Exception as e:
+        # Clean up temp file on error
+        try:
+            if 'temp_path' in locals():
+                os.unlink(temp_path)
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to create download: {str(e)}")
+
+@app.get("/api/photos/{photo_id}")
+async def get_photo_info(photo_id: str):
+    """Get information about a specific photo from the hardware service."""
+    try:
+        photo = await reframe_client.get(f"/photos/{photo_id}")
+        # Rewrite paths to URLs served by this dashboard
+        from os.path import basename as _bn
+        if photo.get("original_path"):
+            photo["original_path"] = f"/photos/{_bn(photo['original_path'])}"
+        if photo.get("dithered_path"):
+            photo["dithered_path"] = f"/dithered/{_bn(photo['dithered_path'])}"
+        return photo
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/photos/{filename}")
+async def serve_original_photo(filename: str):
+    """Serve original photo file."""
+    file_path = os.path.join(PHOTOS_PATH, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Photo not found")
+    return FileResponse(file_path)
+
+@app.get("/dithered/{filename}")
+async def serve_dithered_photo(filename: str):
+    """Serve dithered photo file."""
+    file_path = os.path.join(DITHERED_PHOTOS_PATH, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Dithered photo not found")
+    return FileResponse(file_path)
+
+@app.get("/api/settings")
+async def get_settings():
+    """Get current settings."""
+    return settings_manager.load_public_settings()
+
+@app.post("/api/settings")
+async def update_settings(request: Request):
+    """Update settings and notify the hardware service to reload/apply."""
+    try:
+        settings_data = await request.json()
+        success = settings_manager.save_settings(settings_data)
+        if success:
+            try:
+                await reframe_client.post("/settings/reload")
+            except Exception:
+                # Hardware service might be down; still consider settings saved
+                pass
+            return {"status": "success", "message": "Settings updated successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to save settings")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid settings data: {str(e)}")
+
+@app.get("/api/extensions/actions")
+async def get_extension_actions():
+    """Get extension photo actions safe for the dashboard to render."""
+    settings = settings_manager.load_settings()
+    return {"actions": extension_registry.public_actions(settings)}
+
+@app.post("/api/extensions/{extension_id}/photos/{photo_id}")
+async def run_extension_action(extension_id: str, photo_id: str):
+    """Run an enabled extension against one photo."""
+    extension = extension_registry.get(extension_id)
+    if extension is None:
+        raise HTTPException(status_code=404, detail="Extension not found")
+
+    settings = settings_manager.load_settings()
+    if not extension.configured(settings):
+        raise HTTPException(status_code=400, detail=f"{extension.label} extension is not fully configured")
+
+    try:
+        photo = await reframe_client.get(f"/photos/{photo_id}")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Photo not found: {e}")
+
+    result = await extension.run(photo, settings)
+    return result
+
+@app.get("/api/settings/camera")
+async def get_camera_settings():
+    """Get camera-specific settings."""
+    return settings_manager.get_camera_settings()
+
+@app.get("/api/settings/processing") 
+async def get_processing_settings():
+    """Get processing-specific settings."""
+    return settings_manager.get_processing_settings()
+
+@app.post("/api/capture")
+async def capture_photo(background_tasks: BackgroundTasks):
+    """Capture a new photo with current settings."""
+    try:
+        result = await reframe_client.post("/capture")
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/display/clear")
+async def clear_display():
+    """Proxy to clear the e-ink display on the hardware service."""
+    try:
+        resp = await reframe_client.post("/display/clear")
+        return resp
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear display: {str(e)}")
+
+@app.post("/api/display/{photo_id}")
+async def display_photo_on_screen(photo_id: str):
+    """Display a specific photo on the e-ink screen."""
+    try:
+        result = await reframe_client.post(f"/display/{photo_id}")
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/dashboard/qr")
+async def show_dashboard_qr():
+    """Display the dashboard access QR on the e-ink screen."""
+    try:
+        result = await reframe_client.post("/dashboard/qr")
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to show dashboard QR: {str(e)}")
+
+@app.post("/api/reprocess/{photo_id}")
+async def reprocess_photo(photo_id: str, request: Request):
+    """Reprocess an existing photo with new settings."""
+    try:
+        processing_settings = None
+        try:
+            body = await request.json()
+            processing_settings = body.get("processing_settings")
+        except Exception:
+            processing_settings = None
+        result = await reframe_client.post(f"/reprocess/{photo_id}", json={"processing_settings": processing_settings})
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/status")
+async def get_system_status():
+    """Get system status information."""
+    try:
+        status = await reframe_client.get("/status")
+        return status
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Hardware service unavailable: {str(e)}")
+
+# ═══════════════════════════════════════════════════════════════════
+# HARDWARE: Battery — PiSugar 3 via pisugar-server TCP
+# Battery level is read by sending "get battery" to pisugar-server
+# on TCP port 8423. pisugar-server must be installed separately.
+# To use a different battery monitor, replace this endpoint.
+# See: https://github.com/PiSugar/PiSugar/wiki/PiSugar-Power-Manager-(Software)
+# ═══════════════════════════════════════════════════════════════════
+@app.get("/api/battery")
+async def get_battery_level():
+    """Get battery level from PiSugar."""
+    import subprocess
+    
+    try:
+        # Use TCP method (working reliably)
+        result = subprocess.run(
+            ['nc', '-q', '0', '127.0.0.1', '8423'],
+            input='get battery\n',
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            response = result.stdout.strip()
+            if response.startswith('battery:'):
+                # Handle decimal values and leading spaces
+                battery_str = response.split(':')[1].strip()
+                battery_level = int(float(battery_str))  # Convert decimal to int
+                return {"battery_level": battery_level, "source": "tcp"}
+        
+        # If TCP fails, return unknown
+        return {"battery_level": None, "source": "unknown", "error": "Could not connect to PiSugar"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get battery level: {str(e)}")
+
+@app.post("/api/timeout/reset")
+async def reset_timeout():
+    """Reset the timeout timer (extend the timeout period)."""
+    try:
+        result = await reframe_client.post("/timeout/reset")
+        return result
+    except Exception as e:
+        logging.info(f"Hardware timeout reset unavailable: {e}")
+        return {
+            "status": "unavailable",
+            "message": "Hardware service is not ready yet"
+        }
+
+@app.get("/api/timeout/status")
+async def get_timeout_status():
+    """Get current timeout status and remaining time."""
+    try:
+        result = await reframe_client.get("/timeout/status")
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get timeout status: {str(e)}")
+
+@app.post("/api/photos/{photo_id}/reprocess")
+async def reprocess_single_photo(photo_id: str):
+    """Reprocess a single photo to create missing dithered version."""
+    try:
+        result = await reframe_client.post(f"/reprocess/{photo_id}")
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reprocess photo: {str(e)}")
+
+# Global variable to track download progress
+download_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
+download_abort = False
+
+# Global variable to track delete progress
+delete_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
+delete_abort = False
+
+@app.post("/api/photos/download-all/start")
+async def start_download_all(background_tasks: BackgroundTasks):
+    """Start the download process and return immediately."""
+    global download_progress
+    
+    try:
+        # Get all photos from hardware service
+        all_photos = await reframe_client.get("/photos")
+        
+        if not all_photos:
+            raise HTTPException(status_code=404, detail="No photos found")
+        
+        # Initialize progress
+        global download_abort
+        download_abort = False
+        download_progress = {
+            "status": "preparing",
+            "processed": 0,
+            "total": len(all_photos),
+            "message": "Preparing download..."
+        }
+        
+        # Start background task
+        background_tasks.add_task(create_zip_background, all_photos)
+        
+        return {"status": "started", "total_photos": len(all_photos)}
+        
+    except Exception as e:
+        download_progress = {"status": "error", "processed": 0, "total": 0, "message": str(e)}
+        raise HTTPException(status_code=500, detail=f"Failed to start download: {str(e)}")
+
+@app.get("/api/photos/download-all/progress")
+async def get_download_progress():
+    """Get current download progress."""
+    global download_progress
+    return download_progress
+
+@app.post("/api/photos/download-all/abort")
+async def abort_download():
+    """Abort the current download process."""
+    global download_abort, download_progress
+    download_abort = True
+    download_progress = {
+        "status": "aborted",
+        "processed": download_progress.get("processed", 0),
+        "total": download_progress.get("total", 0),
+        "message": "Download aborted by user"
+    }
+    return {"status": "aborted", "message": "Download aborted"}
+
+@app.get("/api/photos/download-all/result")
+async def get_download_result():
+    """Get the completed ZIP file."""
+    global download_progress
+    
+    print(f"Download result requested. Status: {download_progress.get('status')}")
+    
+    if download_progress["status"] != "completed":
+        print(f"Download not completed. Current status: {download_progress.get('status')}")
+        raise HTTPException(status_code=400, detail="Download not completed yet")
+    
+    zip_path = download_progress.get("zip_path")
+    print(f"ZIP path: {zip_path}")
+    
+    if not zip_path or not os.path.exists(zip_path):
+        print(f"ZIP file not found at: {zip_path}")
+        raise HTTPException(status_code=404, detail="ZIP file not found")
+    
+    print(f"Starting file stream for: {zip_path}")
+    
+    # Stream the file
+    async def file_stream():
+        try:
+            async with aiofiles.open(zip_path, 'rb') as f:
+                while chunk := await f.read(8192):  # 8KB chunks
+                    yield chunk
+            
+            print("File streaming completed")
+            
+            # Clean up
+            try:
+                os.unlink(zip_path)
+                download_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
+                print("Temporary file cleaned up")
+            except Exception as cleanup_error:
+                print(f"Cleanup error: {cleanup_error}")
+        except Exception as stream_error:
+            print(f"Streaming error: {stream_error}")
+            raise
+    
+    return StreamingResponse(
+        file_stream(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=reframe-photos-{datetime.now().strftime('%Y%m%d')}.zip"}
+    )
+
+async def create_zip_background(all_photos):
+    """Background task to create ZIP file."""
+    global download_progress, download_abort
+    import tempfile
+    import zipfile
+    import asyncio
+    
+    try:
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
+            temp_path = temp_file.name
+        
+        download_progress["status"] = "creating"
+        download_progress["message"] = "Creating ZIP file..."
+        
+        # Create ZIP file
+        with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
+            total_photos = len(all_photos)
+            processed = 0
+            
+            for photo in all_photos:
+                # Check for abort
+                if download_abort:
+                    download_progress["status"] = "aborted"
+                    download_progress["message"] = "Download aborted by user"
+                    return
+                
+                try:
+                    # Add original photo
+                    if photo.get("original_path"):
+                        original_file_path = photo["original_path"]
+                        if os.path.exists(original_file_path):
+                            from os.path import basename
+                            filename = basename(original_file_path)
+                            zip_file.write(original_file_path, f"original/{filename}")
+                    
+                    # Add dithered photo
+                    if photo.get("dithered_path"):
+                        dithered_file_path = photo["dithered_path"]
+                        if os.path.exists(dithered_file_path):
+                            from os.path import basename
+                            filename = basename(dithered_file_path)
+                            zip_file.write(dithered_file_path, f"dithered/{filename}")
+                    
+                    processed += 1
+                    download_progress["processed"] = processed
+                    download_progress["message"] = f"Processing photo {processed}/{total_photos}"
+                    
+                    # Small delay for responsiveness
+                    if processed % 2 == 0:
+                        await asyncio.sleep(0.005)
+                        
+                except Exception as e:
+                    print(f"Error adding photo {photo.get('id', 'unknown')} to ZIP: {e}")
+                    processed += 1
+                    download_progress["processed"] = processed
+                    continue
+        
+        # Check for abort before marking as completed
+        if download_abort:
+            download_progress["status"] = "aborted"
+            download_progress["message"] = "Download aborted by user"
+            return
+        
+        # Mark as completed
+        download_progress["status"] = "completed"
+        download_progress["message"] = "ZIP file ready for download"
+        download_progress["zip_path"] = temp_path
+        print(f"ZIP creation completed. File: {temp_path}, Size: {os.path.getsize(temp_path)} bytes")
+        
+    except Exception as e:
+        download_progress["status"] = "error"
+        download_progress["message"] = f"Error: {str(e)}"
+        # Clean up temp file on error
+        try:
+            if 'temp_path' in locals():
+                os.unlink(temp_path)
+        except:
+            pass
+
+async def delete_photos_background(all_photos):
+    """Background task to delete photos."""
+    global delete_progress, delete_abort
+    import asyncio
+    
+    try:
+        delete_progress["status"] = "deleting"
+        delete_progress["message"] = "Deleting photos..."
+        
+        total_photos = len(all_photos)
+        deleted_count = 0
+        
+        for photo in all_photos:
+            # Check for abort
+            if delete_abort:
+                delete_progress["status"] = "aborted"
+                delete_progress["message"] = "Deletion aborted by user"
+                return
+            
+            try:
+                result = await reframe_client.delete(f"/photos/{photo['id']}")
+                if result.get("success"):
+                    deleted_count += 1
+                
+                delete_progress["processed"] = deleted_count
+                delete_progress["message"] = f"Deleted {deleted_count}/{total_photos} photos"
+                
+                # Small delay for responsiveness
+                if deleted_count % 2 == 0:
+                    await asyncio.sleep(0.01)
+                    
+            except Exception as e:
+                print(f"Error deleting photo {photo.get('id', 'unknown')}: {e}")
+                delete_progress["processed"] = deleted_count
+                continue
+        
+        # Check for abort before marking as completed
+        if delete_abort:
+            delete_progress["status"] = "aborted"
+            delete_progress["message"] = "Deletion aborted by user"
+            return
+        
+        # Mark as completed
+        delete_progress["status"] = "completed"
+        delete_progress["message"] = f"Successfully deleted {deleted_count} photos"
+        
+    except Exception as e:
+        delete_progress["status"] = "error"
+        delete_progress["message"] = f"Error: {str(e)}"
+
+@app.post("/api/photos/delete-all/start")
+async def start_delete_all(background_tasks: BackgroundTasks):
+    """Start the delete process and return immediately."""
+    global delete_progress
+    
+    try:
+        # Get all photos from hardware service
+        all_photos = await reframe_client.get("/photos")
+        
+        if not all_photos:
+            return {"status": "completed", "message": "No photos to delete", "deleted_count": 0}
+        
+        # Initialize progress
+        global delete_abort
+        delete_abort = False
+        delete_progress = {
+            "status": "preparing",
+            "processed": 0,
+            "total": len(all_photos),
+            "message": "Preparing deletion..."
+        }
+        
+        # Start background task
+        background_tasks.add_task(delete_photos_background, all_photos)
+        
+        return {"status": "started", "total_photos": len(all_photos)}
+        
+    except Exception as e:
+        delete_progress = {"status": "error", "processed": 0, "total": 0, "message": str(e)}
+        raise HTTPException(status_code=500, detail=f"Failed to start deletion: {str(e)}")
+
+@app.get("/api/photos/delete-all/progress")
+async def get_delete_progress():
+    """Get current delete progress."""
+    global delete_progress
+    return delete_progress
+
+@app.post("/api/photos/delete-all/abort")
+async def abort_delete():
+    """Abort the current delete process."""
+    global delete_abort, delete_progress
+    delete_abort = True
+    delete_progress = {
+        "status": "aborted",
+        "processed": delete_progress.get("processed", 0),
+        "total": delete_progress.get("total", 0),
+        "message": "Deletion aborted by user"
+    }
+    return {"status": "aborted", "message": "Deletion aborted"}
+
+@app.post("/api/photos/delete-all")
+async def delete_all_photos():
+    """Delete all photos from the system."""
+    try:
+        # Get all photos from hardware service
+        all_photos = await reframe_client.get("/photos")
+        
+        if not all_photos:
+            return {"success": True, "message": "No photos to delete"}
+        
+        deleted_count = 0
+        
+        # Delete each photo through the hardware service
+        for photo in all_photos:
+            try:
+                result = await reframe_client.delete(f"/photos/{photo['id']}")
+                if result.get("success"):
+                    deleted_count += 1
+            except Exception as e:
+                print(f"Error deleting photo {photo.get('id', 'unknown')}: {e}")
+                continue
+        
+        return {
+            "success": True, 
+            "message": f"Successfully deleted {deleted_count} photos",
+            "deleted_count": deleted_count
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete photos: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

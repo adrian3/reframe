@@ -1,0 +1,18 @@
+[Unit]
+Description=Reframe Dashboard Port 80 Proxy
+After=reframe-dashboard.service
+Requires=reframe-dashboard.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/cam/reframe
+ExecStart=/usr/bin/python3 /home/cam/reframe/dashboard_proxy.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

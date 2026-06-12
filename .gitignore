@@ -1,0 +1,31 @@
+# Photos (created at runtime)
+photos/
+dithered_photos/
+photos-test/
+dithered_photos-test/
+.runtime/
+
+# Runtime config (copy settings.example.json → settings.json)
+settings.json
+.env
+.env.*
+!.env.example
+*.log
+
+# Dev notes & scripts
+API_METHODS.md
+DASHBOARD_PLAN.md
+camera_api_example.py
+boot_time_analyzer.py
+optimize_hybrid_mode.py
+
+# BOM spreadsheet exports
+Reframe BOM*
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

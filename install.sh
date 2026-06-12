@@ -1,0 +1,255 @@
+#!/bin/bash
+set -e
+
+# ─────────────────────────────────────────────
+#  reFrame installer
+#  Run this on a fresh Raspberry Pi OS Lite
+# ─────────────────────────────────────────────
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[✓]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+error() { echo -e "${RED}[✗]${NC} $1"; }
+step()  { echo -e "\n${GREEN}── $1 ──${NC}"; }
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BOOT_CONFIG="/boot/config.txt"
+[ -f "/boot/firmware/config.txt" ] && BOOT_CONFIG="/boot/firmware/config.txt"
+
+echo ""
+echo "  ┌─────────────────────────────┐"
+echo "  │   reFrame camera installer  │"
+echo "  └─────────────────────────────┘"
+echo ""
+
+# ── 1. System packages ──────────────────────
+step "Installing system packages"
+
+sudo apt update -qq
+sudo apt install -y -qq \
+    python3-pip \
+    python3-picamera2 \
+    python3-spidev \
+    python3-gpiozero \
+    v4l-utils \
+    i2c-tools \
+    netcat-openbsd \
+    wget
+
+info "System packages installed"
+
+# ── 2. Python packages ──────────────────────
+step "Installing Python packages"
+
+pip3 install -r "$SCRIPT_DIR/requirements.txt"
+
+info "Python packages installed"
+
+# ── 3. PiSugar Power Manager ────────────────
+step "Checking for PiSugar Power Manager"
+
+configure_pisugar() {
+    if ! command -v nc >/dev/null 2>&1; then
+        warn "Cannot configure PiSugar automatically: nc is not installed"
+        return
+    fi
+
+    sudo systemctl start pisugar-server 2>/dev/null || true
+
+    for attempt in 1 2 3 4 5; do
+        if echo "get model" | nc -w 2 -q 0 127.0.0.1 8423 >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! echo "get model" | nc -w 2 -q 0 127.0.0.1 8423 >/dev/null 2>&1; then
+        warn "pisugar-server is installed but not responding on port 8423"
+        warn "After it starts, run: echo 'set_anti_mistouch false' | nc -q 0 127.0.0.1 8423"
+        return
+    fi
+
+    if echo "set_anti_mistouch false" | nc -w 2 -q 0 127.0.0.1 8423 | grep -qi "done"; then
+        info "Disabled PiSugar anti-mistouch so one press powers on the camera"
+    else
+        warn "Could not disable PiSugar anti-mistouch automatically"
+        warn "Manual command: echo 'set_anti_mistouch false' | nc -q 0 127.0.0.1 8423"
+    fi
+}
+
+install_pisugar_power_manager() {
+    local installer="/tmp/pisugar-power-manager.sh"
+
+    info "Installing PiSugar Power Manager"
+    wget -q -O "$installer" https://cdn.pisugar.com/release/pisugar-power-manager.sh
+    bash "$installer" -c release
+}
+
+if systemctl list-unit-files | grep -q pisugar-server; then
+    info "pisugar-server is already installed"
+    configure_pisugar
+else
+    warn "pisugar-server not found"
+    echo ""
+    echo "  The PiSugar 3 requires pisugar-server for battery monitoring,"
+    echo "  power management, and one-press power-on configuration."
+    echo "  The official PiSugar installer may ask you to select a model."
+    echo "  Choose 'PiSugar 3' when prompted."
+    echo ""
+
+    install_pisugar_power_manager
+
+    if systemctl list-unit-files | grep -q pisugar-server; then
+        configure_pisugar
+    else
+        warn "PiSugar installer finished, but pisugar-server was not found"
+        warn "Manual install: https://github.com/PiSugar/PiSugar/wiki/PiSugar-3-Series"
+    fi
+fi
+
+# ── 4. Enable hardware interfaces ───────────
+step "Enabling hardware interfaces"
+
+# Enable I2C
+sudo raspi-config nonint do_i2c 0
+info "I2C enabled"
+
+# Enable SPI
+sudo raspi-config nonint do_spi 0
+info "SPI enabled"
+
+if ! grep -q "^camera_auto_detect=1" "$BOOT_CONFIG" 2>/dev/null; then
+    echo "camera_auto_detect=1" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+    info "Camera auto-detect enabled in $BOOT_CONFIG"
+else
+    info "Camera auto-detect already enabled"
+fi
+
+# ── 5. Boot-speed hardware trims ────────────
+step "Applying boot-speed hardware trims"
+
+ensure_boot_config_line() {
+    local key="$1"
+    local line="$2"
+    if grep -q "^${key}=" "$BOOT_CONFIG" 2>/dev/null; then
+        sudo sed -i "s|^${key}=.*|${line}|" "$BOOT_CONFIG"
+    else
+        echo "$line" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+    fi
+}
+
+ensure_exact_boot_config_line() {
+    local line="$1"
+    if ! grep -q "^${line}$" "$BOOT_CONFIG" 2>/dev/null; then
+        echo "$line" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+    fi
+}
+
+ensure_exact_boot_config_line "dtoverlay=disable-bt"
+ensure_boot_config_line "dtparam=audio" "dtparam=audio=off"
+ensure_boot_config_line "hdmi_blanking" "hdmi_blanking=2"
+ensure_boot_config_line "boot_delay" "boot_delay=0"
+sudo sed -i 's/^dtparam=audio=on/#dtparam=audio=on # disabled by reFrame fast boot/' "$BOOT_CONFIG"
+info "Disabled Bluetooth overlay, audio, HDMI output, and boot delay in $BOOT_CONFIG"
+
+# ── 6. User permissions ─────────────────────
+step "Setting up user permissions"
+
+sudo usermod -a -G video,i2c,spi,gpio "$USER"
+info "Added $USER to hardware groups (video, i2c, spi, gpio)"
+
+# ── 7. Configuration ────────────────────────
+step "Setting up configuration"
+
+if [ ! -f "$SCRIPT_DIR/settings.json" ]; then
+    cp "$SCRIPT_DIR/settings.example.json" "$SCRIPT_DIR/settings.json"
+    info "Created settings.json from example"
+else
+    info "settings.json already exists, skipping"
+fi
+
+# Create photo directories
+mkdir -p "$SCRIPT_DIR/photos"
+mkdir -p "$SCRIPT_DIR/dithered_photos"
+info "Photo directories ready"
+
+# ── 8. HDR script ───────────────────────────
+step "Setting up HDR script"
+
+chmod +x "$SCRIPT_DIR/enable_hdr.sh"
+info "enable_hdr.sh marked executable"
+
+# ── 9. Systemd services ─────────────────────
+step "Installing systemd services"
+
+# Install camera service
+sudo cp "$SCRIPT_DIR/reframe.service" /etc/systemd/system/reframe.service
+sudo chmod 644 /etc/systemd/system/reframe.service
+info "Installed reframe.service"
+
+# Install dashboard service
+sudo cp "$SCRIPT_DIR/reframe-dashboard.service" /etc/systemd/system/reframe-dashboard.service
+sudo chmod 644 /etc/systemd/system/reframe-dashboard.service
+info "Installed reframe-dashboard.service"
+
+# Install dashboard proxy service (port 80 -> 8000)
+sudo cp "$SCRIPT_DIR/reframe-dashboard-proxy.service" /etc/systemd/system/reframe-dashboard-proxy.service
+sudo chmod 644 /etc/systemd/system/reframe-dashboard-proxy.service
+info "Installed reframe-dashboard-proxy.service"
+
+# Reload and enable
+sudo systemctl daemon-reload
+sudo systemctl reenable reframe.service
+sudo systemctl enable reframe-dashboard.service
+sudo systemctl enable reframe-dashboard-proxy.service
+info "Services enabled (will start on boot)"
+
+# ── 10. Boot-speed service trims ─────────────
+step "Disabling nonessential boot services"
+
+# These are reversible trims for a headless camera. WiFi, SSH, mDNS/Avahi,
+# PiSugar, and all reFrame services are intentionally left enabled.
+sudo systemctl disable --now \
+    ModemManager.service \
+    triggerhappy.service \
+    triggerhappy.socket \
+    udisks2.service \
+    rsync.service \
+    rpi-eeprom-update.service \
+    bluetooth.service \
+    hciuart.service \
+    bluealsa.service \
+    networking.service \
+    keyboard-setup.service \
+    console-setup.service \
+    rsyslog.service \
+    apt-daily.timer \
+    apt-daily-upgrade.timer \
+    man-db.timer \
+    e2scrub_all.timer \
+    fstrim.timer \
+    2>/dev/null || true
+
+info "Disabled unused desktop/modem/Bluetooth/update timer services when present"
+
+# ── Done ────────────────────────────────────
+echo ""
+echo -e "${GREEN}  ┌─────────────────────────────────────┐${NC}"
+echo -e "${GREEN}  │   Installation complete!             │${NC}"
+echo -e "${GREEN}  └─────────────────────────────────────┘${NC}"
+echo ""
+echo "  Next steps:"
+echo "    1. Reboot:  sudo reboot"
+echo "    2. reFrame will start automatically on boot"
+echo "    3. Dashboard: http://$(hostname).local"
+echo "       Fallback:  http://$(hostname).local:8000"
+echo ""
+echo -ne "  Reboot now? [y/N] "
+read -r response
+if [[ "$response" =~ ^[Yy]$ ]]; then
+    sudo reboot
+fi
