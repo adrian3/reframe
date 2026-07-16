@@ -24,7 +24,8 @@
     "auto_refresh_interval": 30,
     "auto_timeout_minutes": 10,
     "auto_timeout_enabled": true,
-    "show_dashboard_qr_on_first_network": true
+    "show_dashboard_qr_on_first_network": true,
+    "camera_name": ""
   },
   "extensions": {
     "arena": {

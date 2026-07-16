@@ -4,6 +4,7 @@ dithered_photos/
 photos-test/
 dithered_photos-test/
 .runtime/
+.update_backups/
 
 # Runtime config (copy settings.example.json → settings.json)
 settings.json

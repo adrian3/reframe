@@ -93,6 +93,8 @@ Dithered photo shot on [reframe.camera](https://reframe.camera)
 Captured on {timestamp}
 ```
 
+If `system.camera_name` is set in dashboard settings, the captured line appends `by {camera_name}`.
+
 - metadata:
 
 ```json

@@ -98,6 +98,8 @@ http://reframe.local:8000
 
 If you used a different Pi hostname during Raspberry Pi Imager setup, replace `reframe` with that hostname.
 
+Dashboard settings include a software update button for git-based installs. It checks the configured upstream repo, installs fast-forward updates only, preserves ignored user data such as `settings.json` and photos, and asks you to reboot after a successful update.
+
 ### Using with a Phone Hotspot
 
 To use the camera without a WiFi network, enable your phone's hotspot. As long as you added the hotspot name and password during flashing (step 1), the Pi will connect to it automatically on boot.

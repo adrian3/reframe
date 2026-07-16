@@ -6,6 +6,7 @@ import sys
 import logging
 import asyncio
 import time
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -22,6 +23,7 @@ BASE_PATH = os.path.dirname(os.path.realpath(__file__))
 PHOTOS_PATH = os.path.join(BASE_PATH, "photos")
 DITHERED_PHOTOS_PATH = os.path.join(BASE_PATH, "dithered_photos")
 SETTINGS_PATH = os.path.join(BASE_PATH, "settings.json")
+USER_DATA_PATHS = ["settings.json", "photos", "dithered_photos"]
 
 os.makedirs(PHOTOS_PATH, exist_ok=True)
 os.makedirs(DITHERED_PHOTOS_PATH, exist_ok=True)
@@ -56,7 +58,8 @@ class SettingsManager:
                 "auto_refresh_interval": 30,
                 "auto_timeout_minutes": 10,
                 "auto_timeout_enabled": True,
-                "show_dashboard_qr_on_first_network": True
+                "show_dashboard_qr_on_first_network": True,
+                "camera_name": ""
             },
             "extensions": {
                 "arena": {
@@ -199,6 +202,139 @@ class ReframeClient:
             resp = await client.delete(url)
             resp.raise_for_status()
             return resp.json()
+
+
+async def run_repo_command(args: List[str], timeout: int = 30) -> Dict[str, Any]:
+    """Run a command in the repo and return captured output."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=BASE_PATH,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return {
+            "returncode": 124,
+            "stdout": "",
+            "stderr": f"Command timed out: {' '.join(args)}"
+        }
+    except Exception as e:
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": str(e)
+        }
+
+    return {
+        "returncode": proc.returncode,
+        "stdout": stdout.decode("utf-8", errors="replace").strip(),
+        "stderr": stderr.decode("utf-8", errors="replace").strip()
+    }
+
+
+async def run_git(args: List[str], timeout: int = 30) -> Dict[str, Any]:
+    return await run_repo_command(["git", *args], timeout=timeout)
+
+
+def git_error_detail(result: Dict[str, Any], fallback: str) -> str:
+    return result.get("stderr") or result.get("stdout") or fallback
+
+
+async def get_update_status(fetch: bool = True) -> Dict[str, Any]:
+    """Fetch and compare this checkout with its upstream branch."""
+    if not os.path.isdir(os.path.join(BASE_PATH, ".git")):
+        raise HTTPException(status_code=501, detail="Software updates require a git checkout")
+
+    if fetch:
+        fetch_result = await run_git(["fetch", "--quiet", "origin"], timeout=60)
+        if fetch_result["returncode"] != 0:
+            detail = git_error_detail(fetch_result, "git fetch failed")
+            raise HTTPException(status_code=502, detail=f"Could not check for updates: {detail}")
+
+    branch_result = await run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+    branch = branch_result["stdout"] if branch_result["returncode"] == 0 else "unknown"
+
+    upstream_result = await run_git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    upstream = upstream_result["stdout"] if upstream_result["returncode"] == 0 else "origin/main"
+
+    local_result = await run_git(["rev-parse", "HEAD"])
+    remote_result = await run_git(["rev-parse", upstream])
+    if local_result["returncode"] != 0 or remote_result["returncode"] != 0:
+        raise HTTPException(status_code=500, detail="Could not determine current software version")
+
+    local_revision = local_result["stdout"]
+    remote_revision = remote_result["stdout"]
+    base_result = await run_git(["merge-base", "HEAD", upstream])
+    merge_base = base_result["stdout"] if base_result["returncode"] == 0 else ""
+
+    counts_result = await run_git(["rev-list", "--left-right", "--count", f"HEAD...{upstream}"])
+    ahead = 0
+    behind = 0
+    if counts_result["returncode"] == 0:
+        parts = counts_result["stdout"].split()
+        if len(parts) == 2:
+            ahead = int(parts[0])
+            behind = int(parts[1])
+
+    dirty_result = await run_git(["status", "--porcelain", "--untracked-files=no"])
+    has_tracked_changes = bool(dirty_result["stdout"]) if dirty_result["returncode"] == 0 else True
+
+    update_available = local_revision != remote_revision and merge_base == local_revision
+    up_to_date = local_revision == remote_revision
+    diverged = local_revision != remote_revision and merge_base != local_revision
+    can_update = update_available and not has_tracked_changes
+
+    if up_to_date:
+        message = "Software is up to date."
+    elif update_available:
+        message = f"Update available: {behind} commit{'s' if behind != 1 else ''} behind {upstream}."
+    elif diverged:
+        message = "This checkout has diverged from upstream and cannot be updated automatically."
+    else:
+        message = "Could not determine update state."
+
+    if update_available and has_tracked_changes:
+        message = f"{message} Local code changes must be committed or discarded before updating."
+
+    return {
+        "branch": branch,
+        "upstream": upstream,
+        "local_revision": local_revision,
+        "remote_revision": remote_revision,
+        "local_short": local_revision[:7],
+        "remote_short": remote_revision[:7],
+        "ahead": ahead,
+        "behind": behind,
+        "update_available": update_available,
+        "up_to_date": up_to_date,
+        "diverged": diverged,
+        "has_tracked_changes": has_tracked_changes,
+        "can_update": can_update,
+        "message": message
+    }
+
+
+def backup_settings_for_update() -> Optional[str]:
+    """Back up settings before pulling code; ignored photo dirs are left untouched."""
+    settings_path = Path(SETTINGS_PATH)
+    if not settings_path.exists():
+        return None
+
+    backup_dir = Path(BASE_PATH) / ".update_backups" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(settings_path, backup_dir / "settings.json")
+    return str(backup_dir)
+
+
+def ignored_user_data_paths() -> List[str]:
+    return [path for path in USER_DATA_PATHS if os.path.exists(os.path.join(BASE_PATH, path))]
+
 
 class PhotoManager:
     """Manages photo operations for the dashboard."""
@@ -375,7 +511,7 @@ class ArenaExtension(DashboardExtension):
                 s3_url = f"{self.s3_public_base}/{key}"
                 photo_id = photo.get("id", "unknown")
                 created = photo.get("created_at") or photo.get("created")
-                description = self._build_block_description(created)
+                description = self._build_block_description(created, settings)
 
                 block_resp = await self._request_with_retry(
                     client,
@@ -481,11 +617,13 @@ class ArenaExtension(DashboardExtension):
         status_code = response.status_code if response.status_code in detail_by_status else 502
         raise HTTPException(status_code=status_code, detail=detail)
 
-    def _build_block_description(self, created) -> str:
+    def _build_block_description(self, created, settings: Dict[str, Any]) -> str:
         description = "Dithered photo shot on [reframe.camera](https://reframe.camera)"
         captured = self._format_captured_at(created)
         if captured:
-            description = f"{description}\n\nCaptured on {captured}"
+            camera_name = str(settings.get("system", {}).get("camera_name", "")).strip()
+            attribution = f" by {camera_name}" if camera_name else ""
+            description = f"{description}\n\nCaptured on {captured}{attribution}"
         return description
 
     def _format_captured_at(self, created) -> Optional[str]:
@@ -1138,6 +1276,13 @@ async def dashboard():
                     <h3>system settings</h3>
                     <div class="setting-group">
                         <div>
+                            <span class="setting-label">camera name</span>
+                            <input type="text" id="camera-name" class="setting-input" maxlength="80" placeholder="optional">
+                        </div>
+                        <div class="setting-help">Used in Are.na upload descriptions when set.</div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
                             <span class="setting-label">auto refresh interval (seconds)</span>
                             <input type="number" id="auto-refresh-interval" class="setting-input" min="5" max="300">
                         </div>
@@ -1172,6 +1317,15 @@ async def dashboard():
                         <button class="button" onclick="showDashboardQr()" type="button">show dashboard QR</button>
                     </div>
 
+                </div>
+
+                <div class="settings-section">
+                    <h3>software updates</h3>
+                    <div class="setting-group">
+                        <button class="button" id="update-check-btn" onclick="checkForUpdates()" type="button">check for updates</button>
+                        <button class="button" id="update-install-btn" onclick="installUpdate()" type="button" style="display: none;">install update</button>
+                        <div class="setting-help" id="update-status">Updates use the git repo and preserve ignored user data like settings and photos.</div>
+                    </div>
                 </div>
 
                 <div class="settings-section">
@@ -1685,10 +1839,13 @@ async def dashboard():
                 toggleOrderedSettings();
                 
                 // System settings
+                document.getElementById('camera-name').value = settings.system.camera_name || '';
                 document.getElementById('auto-refresh-interval').value = settings.system.auto_refresh_interval;
                 document.getElementById('auto-timeout-enabled').value = settings.system.auto_timeout_enabled ? 'true' : 'false';
                 document.getElementById('auto-timeout-minutes').value = settings.system.auto_timeout_minutes || 10;
                 document.getElementById('show-dashboard-qr-on-first-network').value = settings.system.show_dashboard_qr_on_first_network !== false ? 'true' : 'false';
+                document.getElementById('update-status').textContent = 'Updates use the git repo and preserve ignored user data like settings and photos.';
+                document.getElementById('update-install-btn').style.display = 'none';
 
                 const arenaSettings = (settings.extensions && settings.extensions.arena) || {};
                 document.getElementById('arena-enabled').value = arenaSettings.enabled ? 'true' : 'false';
@@ -1718,6 +1875,72 @@ async def dashboard():
                 document.getElementById('arena-access-token').value = '';
                 updateArenaTokenStatus(false);
             }
+
+            function updateSoftwareStatus(data) {
+                const status = document.getElementById('update-status');
+                const installBtn = document.getElementById('update-install-btn');
+                status.textContent = data.message || 'Update status checked.';
+                installBtn.style.display = data.can_update ? 'inline-block' : 'none';
+            }
+
+            async function checkForUpdates() {
+                const status = document.getElementById('update-status');
+                const checkBtn = document.getElementById('update-check-btn');
+                const installBtn = document.getElementById('update-install-btn');
+
+                try {
+                    checkBtn.disabled = true;
+                    installBtn.style.display = 'none';
+                    status.textContent = 'Checking for updates...';
+                    const response = await fetch('/api/update/status');
+                    const data = await response.json().catch(() => ({}));
+
+                    if (response.ok) {
+                        updateSoftwareStatus(data);
+                    } else {
+                        status.textContent = data.detail || 'Could not check for updates.';
+                    }
+                } catch (error) {
+                    console.error('Error checking for updates:', error);
+                    status.textContent = 'Could not check for updates.';
+                } finally {
+                    checkBtn.disabled = false;
+                }
+            }
+
+            async function installUpdate() {
+                const status = document.getElementById('update-status');
+                const checkBtn = document.getElementById('update-check-btn');
+                const installBtn = document.getElementById('update-install-btn');
+
+                if (!confirm('Install the available update? The camera should be rebooted after the update finishes.')) {
+                    return;
+                }
+
+                try {
+                    checkBtn.disabled = true;
+                    installBtn.disabled = true;
+                    status.textContent = 'Installing update...';
+                    const response = await fetch('/api/update/install', { method: 'POST' });
+                    const data = await response.json().catch(() => ({}));
+
+                    if (response.ok) {
+                        status.textContent = data.message || 'Update installed. Reboot the camera to finish.';
+                        installBtn.style.display = 'none';
+                    } else {
+                        status.textContent = data.detail || 'Could not install update.';
+                        if (data.can_update) {
+                            installBtn.style.display = 'inline-block';
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error installing update:', error);
+                    status.textContent = 'Could not install update.';
+                } finally {
+                    checkBtn.disabled = false;
+                    installBtn.disabled = false;
+                }
+            }
             
             async function saveSettings() {
                 try {
@@ -1740,6 +1963,7 @@ async def dashboard():
                             threshold_scale: parseFloat(document.getElementById('threshold-scale').value)
                         },
                         system: {
+                            camera_name: document.getElementById('camera-name').value.trim(),
                             auto_refresh_interval: parseInt(document.getElementById('auto-refresh-interval').value),
                             auto_timeout_enabled: document.getElementById('auto-timeout-enabled').value === 'true',
                             auto_timeout_minutes: parseInt(document.getElementById('auto-timeout-minutes').value),
@@ -1798,6 +2022,7 @@ async def dashboard():
                                 threshold_scale: 1.0
                             },
                             system: {
+                                camera_name: "",
                                 auto_refresh_interval: 30,
                                 auto_timeout_enabled: true,
                                 auto_timeout_minutes: 10,
@@ -2499,6 +2724,65 @@ async def update_settings(request: Request):
             raise HTTPException(status_code=500, detail="Failed to save settings")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid settings data: {str(e)}")
+
+@app.get("/api/update/status")
+async def update_status():
+    """Check whether the git checkout has a fast-forward update available."""
+    return await get_update_status(fetch=True)
+
+@app.post("/api/update/install")
+async def install_update():
+    """Install a fast-forward git update while leaving ignored user data untouched."""
+    status = await get_update_status(fetch=True)
+
+    if status["up_to_date"]:
+        return {
+            **status,
+            "status": "success",
+            "message": "Software is already up to date."
+        }
+
+    if status["diverged"]:
+        raise HTTPException(
+            status_code=409,
+            detail="This checkout has diverged from upstream and cannot be updated automatically"
+        )
+
+    if status["has_tracked_changes"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Local code changes must be committed or discarded before updating"
+        )
+
+    if not status["update_available"]:
+        raise HTTPException(status_code=409, detail="No automatic update is available")
+
+    backup_dir = backup_settings_for_update()
+    preserved_paths = ignored_user_data_paths()
+    upstream = status["upstream"]
+    pull_args = ["pull", "--ff-only"]
+    if "/" in upstream:
+        remote, branch = upstream.split("/", 1)
+        pull_args.extend([remote, branch])
+
+    pull_result = await run_git(pull_args, timeout=180)
+    if pull_result["returncode"] != 0:
+        detail = git_error_detail(pull_result, "git pull failed")
+        raise HTTPException(status_code=500, detail=f"Could not install update: {detail}")
+
+    new_status = await get_update_status(fetch=False)
+    message = "Update installed. Reboot the camera to finish."
+    if backup_dir:
+        message = f"{message} Settings backup: {backup_dir}"
+
+    return {
+        **new_status,
+        "status": "success",
+        "message": message,
+        "backup_dir": backup_dir,
+        "preserved_paths": preserved_paths,
+        "pull_output": pull_result["stdout"]
+    }
 
 @app.get("/api/extensions/actions")
 async def get_extension_actions():
