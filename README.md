@@ -65,6 +65,8 @@ reFrame is extremely minimalist by design. It has only a single button; no viewf
 
 A web dashboard, accessible over the local network, lets you browse photos, download originals, change the displayed image, adjust camera settings, and optionally upload dithered photos to Are.na.
 
+<img src="docs/images/reframe-dashboard.webp" alt="reFrame dashboard showing the photo gallery and camera controls" width="960" />
+
 ## Repository Structure
 
 ```
@@ -72,6 +74,7 @@ reframe/
 ├── reframe.py               # main camera application
 ├── dashboard.py              # web dashboard for photo management
 ├── install.sh                # one-command setup script
+├── reframe-apply-update      # privileged post-update installer
 ├── settings.example.json     # default configuration
 ├── enable_hdr.sh             # HDR initialization script
 ├── dashboard_proxy.py        # local port 80 dashboard proxy

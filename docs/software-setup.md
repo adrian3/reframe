@@ -82,6 +82,8 @@ After rebooting, reFrame starts automatically. The camera takes a photo on start
 
 ## Dashboard
 
+![reFrame dashboard showing the photo gallery and camera controls](images/reframe-dashboard.webp)
+
 Open a browser on any device connected to the same network:
 
 ```
@@ -98,7 +100,7 @@ http://reframe.local:8000
 
 If you used a different Pi hostname during Raspberry Pi Imager setup, replace `reframe` with that hostname.
 
-Dashboard settings include a software update button for git-based installs. It checks the configured upstream repo, installs fast-forward updates only, preserves ignored user data such as `settings.json` and photos, and asks you to reboot after a successful update.
+Dashboard settings include a software update button for git-based installs. It checks the configured upstream repo, installs fast-forward updates only, preserves ignored user data such as your settings and photos, refreshes dependencies and service files, and asks you to reboot after a successful update.
 
 ### Using with a Phone Hotspot
 
@@ -106,7 +108,7 @@ To use the camera without a WiFi network, enable your phone's hotspot. As long a
 
 On iPhone, you can find your hotspot name under Settings → General → About → Name. Enable **Maximize Compatibility** in hotspot settings for the Pi to connect reliably.
 
-Once connected, the camera shows a dashboard QR code on the ePaper display when it sees a new IP address. Scan the QR code and use the IP fallback URL if `reframe.local` or `pi.local` does not resolve.
+Whenever the camera connects or reconnects to WiFi, it shows a dashboard QR code on the ePaper display. The network watcher remains active after startup, and the QR encodes the numeric IP when one is available so it also works on hotspots that do not resolve `.local` hostnames. This behavior is enabled by default and can be disabled under system settings in the dashboard.
 
 On Android/Pixel hotspots, `.local` hostnames may not resolve reliably. In that case, use the QR code's numeric IP URL, for example `http://192.168.x.x`.
 

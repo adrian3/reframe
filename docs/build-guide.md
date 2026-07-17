@@ -90,6 +90,8 @@ Before starting assembly, make sure you have printed all the necessary enclosure
    - **Enable SSH** with password authentication
 5. Write the image and eject the card.
 
+The username `cam` is required by the current service and updater configuration.
+
 ## Step 2: Soldering & Wiring Preparations
 
 In this step, we will prepare the wire connections for the shutter button, the PiSugar 3 battery board, and the USB-C breakout board.
