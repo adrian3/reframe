@@ -77,7 +77,6 @@ BASE_PATH = os.path.dirname(os.path.realpath(__file__))
 SAVE_PATH = os.path.join(BASE_PATH, "photos")
 PROCESSED_PATH = os.path.join(BASE_PATH, "dithered_photos")
 RUNTIME_PATH = os.path.join(BASE_PATH, ".runtime")
-QR_STATE_PATH = os.path.join(RUNTIME_PATH, "dashboard_qr_state.json")
 ORIGINAL_CAPTURE_EXTENSION = "jpg"
 DISPLAY_IMAGE_WIDTH = 600
 DISPLAY_IMAGE_HEIGHT = 400
@@ -160,37 +159,6 @@ def _is_usable_lan_ip(ip_address):
     )
 
 
-def load_dashboard_qr_state():
-    try:
-        with open(QR_STATE_PATH, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"shown_markers": []}
-
-
-def save_dashboard_qr_state(state):
-    os.makedirs(RUNTIME_PATH, exist_ok=True)
-    with open(QR_STATE_PATH, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def should_show_dashboard_qr(marker, ip_address=None):
-    state = load_dashboard_qr_state()
-    if ip_address and ip_address != state.get("last_ip_address"):
-        return True
-    return marker not in state.get("shown_markers", [])
-
-
-def record_dashboard_qr_shown(marker, ip_address=None):
-    state = load_dashboard_qr_state()
-    shown_markers = state.setdefault("shown_markers", [])
-    if marker not in shown_markers:
-        shown_markers.append(marker)
-    if ip_address:
-        state["last_ip_address"] = ip_address
-    save_dashboard_qr_state(state)
-
-
 def render_dashboard_qr_image(access_info):
     """Render a dashboard QR screen for the ePaper display."""
     Image, _ = _lazy_import_pil()
@@ -200,8 +168,9 @@ def render_dashboard_qr_image(access_info):
     primary_url = access_info["primary_url"]
     fallback_url = access_info.get("fallback_url")
 
+    qr_url = fallback_url or primary_url
     qr = qrcode.QRCode(border=2, box_size=8)
-    qr.add_data(primary_url)
+    qr.add_data(qr_url)
     qr.make(fit=True)
     qr_image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     qr_image = qr_image.resize((250, 250))
@@ -270,7 +239,7 @@ class CameraManager:
                     "auto_refresh_interval": 30,
                     "auto_timeout_minutes": 10,
                     "auto_timeout_enabled": True,
-                    "show_dashboard_qr_on_first_network": True
+                    "show_dashboard_qr_on_wifi_connect": True
                 }
             }
 
@@ -912,10 +881,31 @@ class FileManager:
         self.processed_path = processed_path
         os.makedirs(save_path, exist_ok=True)
         os.makedirs(processed_path, exist_ok=True)
+        self._id_lock = threading.Lock()
+        self._next_photo_index = self._find_next_photo_index()
+
+    def _find_next_photo_index(self):
+        """Seed the monotonic photo counter from numeric filenames on disk."""
+        highest_index = -1
+        try:
+            for filename in os.listdir(self.save_path):
+                stem, extension = os.path.splitext(filename)
+                if extension.lower() not in {".png", ".jpg", ".jpeg"}:
+                    continue
+                if stem.isdigit():
+                    highest_index = max(highest_index, int(stem))
+        except OSError as e:
+            logging.warning(f"Could not scan existing photo IDs: {e}")
+        return highest_index + 1
 
     def get_new_file_path(self, folder, extension="png"):
         """Generates a new unique file path in the specified folder."""
-        index = len(os.listdir(folder))
+        if os.path.abspath(folder) != os.path.abspath(self.save_path):
+            raise ValueError("Photo IDs can only be allocated in the original photo directory")
+
+        with self._id_lock:
+            index = self._next_photo_index
+            self._next_photo_index += 1
         return os.path.join(folder, f"{str(index).zfill(5)}.{extension}")
 
     def save_image(self, image, folder, extension="png"):
@@ -1210,14 +1200,17 @@ class CameraSystem:
         self.timeout_thread = None
         self.timeout_running = False
         self._timeout_started = False
+        self._timeout_stop_event = threading.Event()
         self.dashboard_qr_thread = None
         self._dashboard_qr_monitor_started = False
+        self.dashboard_qr_running = False
         logging.info("Timeout monitor initialization deferred for fast startup")
 
     def start_timeout_monitor(self):
         """Start the background timeout monitoring thread."""
         if not self._timeout_started and self.camera_manager.is_timeout_enabled():
             self.timeout_running = True
+            self._timeout_stop_event.clear()
             self.timeout_thread = threading.Thread(target=self._timeout_monitor_loop, daemon=True)
             self.timeout_thread.start()
             self._timeout_started = True
@@ -1236,15 +1229,18 @@ class CameraSystem:
     def stop_timeout_monitor(self):
         """Stop the background timeout monitoring thread."""
         self.timeout_running = False
+        self._timeout_stop_event.set()
         if self.timeout_thread and self.timeout_thread.is_alive():
-            self.timeout_thread.join(timeout=1)
+            self.timeout_thread.join(timeout=2)
+        self._timeout_started = False
 
     def _timeout_monitor_loop(self):
         """Background loop that checks for timeout and shuts down system."""
         # Wait a bit before starting to check for timeout to avoid false triggers on startup
-        time.sleep(60)  # Wait 1 minute before first timeout check
+        if self._timeout_stop_event.wait(60):
+            return
 
-        while self.timeout_running:
+        while self.timeout_running and not self._timeout_stop_event.is_set():
             try:
                 if self.camera_manager.is_timeout_exceeded():
                     logging.info("Timeout exceeded, initiating system shutdown")
@@ -1254,13 +1250,13 @@ class CameraSystem:
 
                 # Check every 30 seconds
                 for _ in range(30):
-                    if not self.timeout_running:
+                    if self._timeout_stop_event.wait(1):
                         break
-                    time.sleep(1)
 
             except Exception as e:
                 logging.error(f"Error in timeout monitor: {e}")
-                time.sleep(10)  # Wait before retrying
+                if self._timeout_stop_event.wait(10):
+                    break
 
     def update_activity(self):
         """Update activity time."""
@@ -1273,7 +1269,7 @@ class CameraSystem:
             "access": get_dashboard_access_info()
         }
 
-    def display_dashboard_qr_api(self, record_shown=False):
+    def display_dashboard_qr_api(self):
         """API-style dashboard QR display."""
         access_info = get_dashboard_access_info()
         if not access_info.get("ip_address"):
@@ -1284,39 +1280,60 @@ class CameraSystem:
             }
 
         result = self.eink_display.display_dashboard_qr(access_info)
-        if result.get("success") and record_shown:
-            record_dashboard_qr_shown(access_info["marker"], access_info.get("ip_address"))
         return result
 
     def start_dashboard_qr_monitor(self):
-        """Show the dashboard QR once after the first usable network appears."""
+        """Watch for usable network changes for the lifetime of the process."""
         if self._dashboard_qr_monitor_started:
-            return
-        if not self.camera_manager.settings.get("system", {}).get("show_dashboard_qr_on_first_network", True):
-            logging.info("Dashboard QR monitor disabled by settings")
             return
 
         self._dashboard_qr_monitor_started = True
+        self.dashboard_qr_running = True
         self.dashboard_qr_thread = threading.Thread(target=self._dashboard_qr_monitor_loop, daemon=True)
         self.dashboard_qr_thread.start()
 
+    def stop_dashboard_qr_monitor(self):
+        self.dashboard_qr_running = False
+        if self.dashboard_qr_thread and self.dashboard_qr_thread.is_alive():
+            self.dashboard_qr_thread.join(timeout=1)
+
     def _dashboard_qr_monitor_loop(self):
-        for _ in range(24):  # 2 minutes total
+        last_connection_ip = None
+        was_enabled = False
+        while self.dashboard_qr_running:
             try:
+                system_settings = self.camera_manager.settings.get("system", {})
+                enabled = system_settings.get(
+                    "show_dashboard_qr_on_wifi_connect",
+                    system_settings.get("show_dashboard_qr_on_first_network", True)
+                )
+                if not enabled:
+                    last_connection_ip = get_lan_ip_address()
+                    was_enabled = False
+                    time.sleep(5)
+                    continue
+
                 access_info = get_dashboard_access_info()
-                if access_info.get("ip_address"):
-                    if should_show_dashboard_qr(access_info["marker"], access_info.get("ip_address")):
-                        logging.info("New dashboard network detected; displaying dashboard QR")
-                        with _operation_lock:
-                            self.display_dashboard_qr_api(record_shown=True)
-                    else:
-                        logging.info("Dashboard QR already shown for this access marker and IP")
-                    return
+                ip_address = access_info.get("ip_address")
+                if not ip_address:
+                    last_connection_ip = None
+                    was_enabled = True
+                elif not was_enabled or ip_address != last_connection_ip:
+                    if self.eink_display.is_busy():
+                        time.sleep(5)
+                        continue
+                    logging.info(
+                        "Wi-Fi connected at %s; displaying dashboard QR",
+                        ip_address
+                    )
+                    with _operation_lock:
+                        result = self.display_dashboard_qr_api()
+                    if result.get("success"):
+                        last_connection_ip = ip_address
+                        was_enabled = True
             except Exception as e:
                 logging.warning(f"Dashboard QR monitor error: {e}")
             time.sleep(5)
-
-        logging.info("Dashboard QR monitor timed out waiting for a LAN IP")
 
     def capture_photo_api(self, fast_mode=False):
         """API-style photo capture with optimized display pipeline.
@@ -1602,7 +1619,7 @@ def _create_fastapi_routes():
         if camera_system is None:
             raise HTTPException(status_code=503, detail="Camera system not initialized")
         with _operation_lock:
-            return camera_system.display_dashboard_qr_api(record_shown=True)
+            return camera_system.display_dashboard_qr_api()
 
     @app.post("/api/timeout/reset")
     def api_reset_timeout():
@@ -1768,6 +1785,7 @@ def main():
             # Stop timeout monitor and put display to sleep if initialized inside CameraSystem
             if camera_system:
                 camera_system.stop_timeout_monitor()
+                camera_system.stop_dashboard_qr_monitor()
                 if camera_system.eink_display:
                     camera_system.eink_display.sleep()
         except Exception:
