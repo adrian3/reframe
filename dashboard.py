@@ -7,13 +7,15 @@ import logging
 import asyncio
 import time
 import shutil
+import math
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse
-import aiofiles
 from fastapi.responses import FileResponse, HTMLResponse
+from starlette.background import BackgroundTask
 import httpx
 
 CAMERA_AVAILABLE = False
@@ -24,11 +26,89 @@ PHOTOS_PATH = os.path.join(BASE_PATH, "photos")
 DITHERED_PHOTOS_PATH = os.path.join(BASE_PATH, "dithered_photos")
 SETTINGS_PATH = os.path.join(BASE_PATH, "settings.json")
 USER_DATA_PATHS = ["settings.json", "photos", "dithered_photos"]
+UPDATE_HELPER_PATH = "/usr/local/sbin/reframe-apply-update"
+UPDATE_PENDING_PATH = os.path.join(BASE_PATH, ".runtime", "update_pending")
 
 os.makedirs(PHOTOS_PATH, exist_ok=True)
 os.makedirs(DITHERED_PHOTOS_PATH, exist_ok=True)
 
 app = FastAPI(title="Reframe Dashboard", description="Control & Gallery Interface for Reframe Camera")
+
+
+class SettingsValidationError(ValueError):
+    pass
+
+
+def validate_settings(settings: Dict[str, Any]) -> None:
+    """Validate persisted settings against the hardware and dashboard contract."""
+    if not isinstance(settings, dict):
+        raise SettingsValidationError("Settings must be a JSON object")
+
+    def section(parent: Dict[str, Any], key: str, path: str) -> Dict[str, Any]:
+        value = parent.get(key, {})
+        if not isinstance(value, dict):
+            raise SettingsValidationError(f"{path} must be an object")
+        return value
+
+    def number(value: Any, path: str, minimum: float, maximum: float) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise SettingsValidationError(f"{path} must be a number")
+        if value < minimum or value > maximum:
+            raise SettingsValidationError(f"{path} must be between {minimum} and {maximum}")
+
+    def integer(value: Any, path: str, minimum: int, maximum: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SettingsValidationError(f"{path} must be an integer")
+        if value < minimum or value > maximum:
+            raise SettingsValidationError(f"{path} must be between {minimum} and {maximum}")
+
+    def boolean(value: Any, path: str) -> None:
+        if not isinstance(value, bool):
+            raise SettingsValidationError(f"{path} must be true or false")
+
+    def text(value: Any, path: str, maximum: int, allow_controls: bool = False) -> None:
+        if not isinstance(value, str):
+            raise SettingsValidationError(f"{path} must be text")
+        if len(value) > maximum:
+            raise SettingsValidationError(f"{path} must be {maximum} characters or fewer")
+        if not allow_controls and any(ord(char) < 32 for char in value):
+            raise SettingsValidationError(f"{path} cannot contain control characters")
+
+    camera = section(settings, "camera", "camera")
+    resolution = section(camera, "resolution", "camera.resolution")
+    integer(resolution.get("width"), "camera.resolution.width", 100, 4000)
+    integer(resolution.get("height"), "camera.resolution.height", 100, 4000)
+    number(camera.get("exposure_value"), "camera.exposure_value", -2, 2)
+    number(camera.get("sharpness"), "camera.sharpness", 0, 10)
+    if camera.get("autofocus_mode") not in {0, 1, 2}:
+        raise SettingsValidationError("camera.autofocus_mode must be 0, 1, or 2")
+
+    processing = section(settings, "processing", "processing")
+    number(processing.get("saturation"), "processing.saturation", 0, 2)
+    number(processing.get("brightness_factor"), "processing.brightness_factor", 0.1, 3)
+    number(processing.get("color_factor"), "processing.color_factor", 0.1, 3)
+    if processing.get("dithering_method") not in {"floyd_steinberg", "ordered"}:
+        raise SettingsValidationError("processing.dithering_method is unsupported")
+    if processing.get("bayer_size") not in {2, 4, 8}:
+        raise SettingsValidationError("processing.bayer_size must be 2, 4, or 8")
+    number(processing.get("threshold_scale"), "processing.threshold_scale", 0.1, 2)
+
+    display = section(settings, "display", "display")
+    boolean(display.get("auto_display"), "display.auto_display")
+    number(display.get("display_timeout"), "display.display_timeout", 0, 3600)
+
+    system = section(settings, "system", "system")
+    integer(system.get("auto_refresh_interval"), "system.auto_refresh_interval", 5, 300)
+    integer(system.get("auto_timeout_minutes"), "system.auto_timeout_minutes", 1, 60)
+    boolean(system.get("auto_timeout_enabled"), "system.auto_timeout_enabled")
+    boolean(system.get("show_dashboard_qr_on_wifi_connect"), "system.show_dashboard_qr_on_wifi_connect")
+    text(system.get("camera_name", ""), "system.camera_name", 80)
+
+    extensions = section(settings, "extensions", "extensions")
+    arena = section(extensions, "arena", "extensions.arena")
+    boolean(arena.get("enabled"), "extensions.arena.enabled")
+    text(arena.get("channel", ""), "extensions.arena.channel", 200)
+    text(arena.get("access_token", ""), "extensions.arena.access_token", 4096)
 
 class SettingsManager:
     """Manages settings operations for the dashboard."""
@@ -58,7 +138,7 @@ class SettingsManager:
                 "auto_refresh_interval": 30,
                 "auto_timeout_minutes": 10,
                 "auto_timeout_enabled": True,
-                "show_dashboard_qr_on_first_network": True,
+                "show_dashboard_qr_on_wifi_connect": True,
                 "camera_name": ""
             },
             "extensions": {
@@ -98,20 +178,51 @@ class SettingsManager:
     def save_settings(self, settings: Dict[str, Any]) -> bool:
         """Save settings to JSON file."""
         try:
+            if not isinstance(settings, dict):
+                raise SettingsValidationError("Settings must be a JSON object")
             # Merge with existing settings to preserve structure
             current_settings = self.load_settings()
             settings = self._prepare_settings_for_save(current_settings, settings)
             merged_settings = self._deep_merge(current_settings, settings)
-            
-            with open(self.settings_path, 'w') as f:
-                json.dump(merged_settings, f, indent=2)
+            validate_settings(merged_settings)
+            self._write_settings(merged_settings)
             return True
+        except SettingsValidationError:
+            raise
         except Exception as e:
             print(f"Error saving settings: {e}")
             return False
+
+    def replace_settings(self, settings: Dict[str, Any]) -> None:
+        """Atomically replace settings with a previously validated snapshot."""
+        validate_settings(settings)
+        self._write_settings(settings)
+
+    def _write_settings(self, settings: Dict[str, Any]) -> None:
+        """Write JSON beside the target and atomically move it into place."""
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{self.settings_path.name}.",
+            dir=str(self.settings_path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w") as temp_file:
+                json.dump(settings, temp_file, indent=2)
+                temp_file.write("\n")
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_path, self.settings_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
     
     def _merge_with_defaults(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         """Merge loaded settings with defaults to ensure all keys exist."""
+        system_settings = settings.get("system")
+        if isinstance(system_settings, dict):
+            legacy_value = system_settings.pop("show_dashboard_qr_on_first_network", None)
+            if "show_dashboard_qr_on_wifi_connect" not in system_settings and legacy_value is not None:
+                system_settings["show_dashboard_qr_on_wifi_connect"] = legacy_value
         return self._deep_merge(self.default_settings.copy(), settings)
     
     def _deep_merge(self, default: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -141,7 +252,9 @@ class SettingsManager:
             .get("access_token", "")
         )
         incoming_token = arena_settings.get("access_token")
-        clear_token = bool(arena_settings.pop("access_token_clear", False))
+        clear_token = arena_settings.pop("access_token_clear", False)
+        if not isinstance(clear_token, bool):
+            raise SettingsValidationError("extensions.arena.access_token_clear must be true or false")
 
         if clear_token:
             arena_settings["access_token"] = ""
@@ -159,8 +272,8 @@ class SettingsManager:
             return False
         extension_settings[secret_key] = ""
         try:
-            with open(self.settings_path, 'w') as f:
-                json.dump(settings, f, indent=2)
+            validate_settings(settings)
+            self._write_settings(settings)
             return True
         except Exception as e:
             print(f"Error clearing extension secret: {e}")
@@ -288,9 +401,12 @@ async def get_update_status(fetch: bool = True) -> Dict[str, Any]:
     update_available = local_revision != remote_revision and merge_base == local_revision
     up_to_date = local_revision == remote_revision
     diverged = local_revision != remote_revision and merge_base != local_revision
-    can_update = update_available and not has_tracked_changes
+    post_install_pending = os.path.exists(UPDATE_PENDING_PATH)
+    can_update = (update_available or post_install_pending) and not has_tracked_changes
 
-    if up_to_date:
+    if post_install_pending:
+        message = "Code is up to date, but installation steps still need to finish."
+    elif up_to_date:
         message = "Software is up to date."
     elif update_available:
         message = f"Update available: {behind} commit{'s' if behind != 1 else ''} behind {upstream}."
@@ -315,6 +431,7 @@ async def get_update_status(fetch: bool = True) -> Dict[str, Any]:
         "up_to_date": up_to_date,
         "diverged": diverged,
         "has_tracked_changes": has_tracked_changes,
+        "post_install_pending": post_install_pending,
         "can_update": can_update,
         "message": message
     }
@@ -677,7 +794,7 @@ async def dashboard():
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
         <title>Reframe</title>
         <style>
             :root {
@@ -698,6 +815,16 @@ async def dashboard():
                 background: var(--primary-color);
                 min-height: 100vh;
                 color: var(--secondary-color);
+            }
+
+            html.settings-open,
+            body.settings-open {
+                overflow: hidden;
+            }
+
+            body.settings-open {
+                position: fixed;
+                width: 100%;
             }
             
             .container {
@@ -789,7 +916,38 @@ async def dashboard():
                 font-size: 1rem;
                 margin: 0 20px;
             }
-            
+
+            .pagination-ellipsis {
+                display: inline-flex;
+                align-items: center;
+                padding: 0 4px;
+            }
+
+            #page-numbers {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+            }
+
+            .pagination-jump {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                white-space: nowrap;
+            }
+
+            .pagination-jump input {
+                width: 64px;
+                height: 32px;
+                border: 1px solid var(--secondary-color);
+                background: var(--tertiary-color);
+                color: var(--secondary-color);
+                padding: 4px 6px;
+                font-family: serif;
+                font-size: 1rem;
+                text-align: center;
+            }
+
             .gallery h2 {
                 margin-bottom: 40px;
                 color: var(--secondary-color);
@@ -934,31 +1092,44 @@ async def dashboard():
                 width: 100%;
                 height: 100%;
                 background-color: rgba(0,0,0,0.8);
+                overflow: hidden;
+                overscroll-behavior: contain;
             }
             
             .settings-content {
                 background-color: var(--tertiary-color);
-                margin: 5% auto;
-                padding: 40px;
+                margin: 3vh auto;
+                padding: 32px;
                 border: 2px solid var(--secondary-color);
-                width: 90%;
-                max-width: 800px;
-                max-height: 80vh;
+                width: min(94vw, 1200px);
+                height: 94vh;
+                box-sizing: border-box;
                 overflow-y: auto;
+                overscroll-behavior: contain;
+                -webkit-overflow-scrolling: touch;
             }
             
             .settings-header {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                margin-bottom: 30px;
-                border-bottom: 2px solid var(--secondary-color);
-                padding-bottom: 20px;
+                margin-bottom: 24px;
             }
             
             .settings-header h2 {
                 font-size: 1rem;
                 font-weight: normal;
+            }
+
+            .settings-header-actions {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+
+            .settings-header-actions .save-btn {
+                margin-right: 0;
+                padding: 10px 20px;
             }
             
             .close-btn {
@@ -974,11 +1145,42 @@ async def dashboard():
             .close-btn:hover {
                 background: var(--hover-color);
             }
+
+            .settings-grid {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                grid-template-areas:
+                    "camera processing"
+                    "system processing"
+                    "system extensions"
+                    "updates extensions";
+                gap: 20px;
+                align-items: stretch;
+            }
             
             .settings-section {
-                margin-bottom: 30px;
                 border: 1px solid var(--secondary-color);
                 padding: 20px;
+            }
+
+            .settings-camera {
+                grid-area: camera;
+            }
+
+            .settings-processing {
+                grid-area: processing;
+            }
+
+            .settings-system {
+                grid-area: system;
+            }
+
+            .settings-updates {
+                grid-area: updates;
+            }
+
+            .settings-extensions {
+                grid-area: extensions;
             }
             
             .settings-section h3 {
@@ -1009,6 +1211,25 @@ async def dashboard():
                 font-family: serif;
                 font-size: 1rem;
                 min-width: 100px;
+                width: 100%;
+                height: 44px;
+                border-radius: 0;
+                background-color: var(--tertiary-color);
+                color: var(--secondary-color);
+            }
+
+            select.setting-input {
+                appearance: none;
+                -webkit-appearance: none;
+                padding-right: 38px;
+                background-image:
+                    linear-gradient(45deg, transparent 50%, var(--secondary-color) 50%),
+                    linear-gradient(135deg, var(--secondary-color) 50%, transparent 50%);
+                background-position:
+                    calc(100% - 15px) 19px,
+                    calc(100% - 10px) 19px;
+                background-size: 5px 5px, 5px 5px;
+                background-repeat: no-repeat;
             }
             
             .setting-input:focus {
@@ -1047,11 +1268,30 @@ async def dashboard():
                 display: none;
             }
             
-            .settings-actions {
-                margin-top: 30px;
-                text-align: center;
-                border-top: 2px solid var(--secondary-color);
-                padding-top: 20px;
+            .settings-footer-actions {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 12px;
+                margin-top: 24px;
+                align-items: start;
+            }
+
+            .settings-footer-actions > div {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+
+            .settings-footer-actions button {
+                width: 100%;
+                min-width: 0;
+                min-height: 48px;
+                margin: 0;
+                padding: 12px 16px;
+            }
+
+            .danger-btn {
+                background: #d32f2f;
             }
             
             .save-btn {
@@ -1085,6 +1325,12 @@ async def dashboard():
             }
             
             @media (max-width: 768px) {
+                .settings-modal {
+                    height: 100vh;
+                    height: -webkit-fill-available;
+                    height: 100dvh;
+                }
+
                 .photo-grid {
                     grid-template-columns: 1fr;
                 }
@@ -1105,9 +1351,43 @@ async def dashboard():
                 }
                 
                 .settings-content {
-                    margin: 2% auto;
+                    margin: 8px auto;
                     padding: 20px;
+                    padding-bottom: calc(28px + env(safe-area-inset-bottom, 0px));
                     width: 95%;
+                    height: calc(100% - 16px);
+                    scroll-padding-bottom: calc(28px + env(safe-area-inset-bottom, 0px));
+                }
+
+                .settings-header {
+                    align-items: flex-start;
+                    gap: 16px;
+                }
+
+                .settings-header-actions {
+                    flex-wrap: wrap;
+                    justify-content: flex-end;
+                    gap: 8px;
+                }
+
+                .settings-header-actions .save-btn,
+                .settings-header-actions .close-btn {
+                    padding: 10px 12px;
+                }
+
+                .settings-grid {
+                    grid-template-columns: 1fr;
+                    grid-template-areas:
+                        "camera"
+                        "processing"
+                        "system"
+                        "updates"
+                        "extensions";
+                }
+
+                .settings-footer-actions {
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                    padding-bottom: env(safe-area-inset-bottom, 0px);
                 }
                 
                 .setting-group {
@@ -1132,6 +1412,17 @@ async def dashboard():
                     margin: 10px 0;
                     width: 100%;
                     text-align: center;
+                }
+
+                #page-numbers {
+                    flex-wrap: wrap;
+                    justify-content: center;
+                }
+
+                .pagination-jump {
+                    width: 100%;
+                    justify-content: center;
+                    margin-top: 8px;
                 }
             }
         </style>
@@ -1170,6 +1461,11 @@ async def dashboard():
                     <div class="pagination-info">
                         <span id="pagination-info"></span>
                     </div>
+                    <form class="pagination-jump" onsubmit="jumpToPage(event)">
+                        <label for="page-jump-input">page</label>
+                        <input type="number" id="page-jump-input" min="1" step="1" inputmode="numeric" aria-label="Go to page">
+                        <button class="pagination-btn" type="submit">go</button>
+                    </form>
                     <button class="pagination-btn" id="next-btn" onclick="changePage(currentPage + 1)">next</button>
                 </div>
             </div>
@@ -1180,10 +1476,14 @@ async def dashboard():
             <div class="settings-content">
                 <div class="settings-header">
                     <h2>settings</h2>
-                    <button class="close-btn" onclick="closeSettings()">close</button>
+                    <div class="settings-header-actions">
+                        <button class="save-btn" onclick="saveSettings()">save settings</button>
+                        <button class="close-btn" onclick="closeSettings()">close</button>
+                    </div>
                 </div>
                 
-                <div class="settings-section">
+                <div class="settings-grid">
+                <div class="settings-section settings-camera">
                     <h3>camera settings</h3>
                     <div class="setting-group disabled-setting">
                         <div>
@@ -1221,7 +1521,7 @@ async def dashboard():
                     </div>
                 </div>
                 
-                <div class="settings-section">
+                <div class="settings-section settings-processing">
                     <h3>processing settings</h3>
                     <div class="setting-group">
                         <div>
@@ -1272,7 +1572,7 @@ async def dashboard():
                     </div>
                 </div>
                 
-                <div class="settings-section">
+                <div class="settings-section settings-system">
                     <h3>system settings</h3>
                     <div class="setting-group">
                         <div>
@@ -1306,12 +1606,13 @@ async def dashboard():
                     </div>
                     <div class="setting-group">
                         <div>
-                            <span class="setting-label">dashboard QR on first network</span>
-                            <select id="show-dashboard-qr-on-first-network" class="setting-input">
+                            <span class="setting-label">dashboard QR on Wi-Fi connect</span>
+                            <select id="show-dashboard-qr-on-wifi-connect" class="setting-input">
                                 <option value="true">enabled</option>
                                 <option value="false">disabled</option>
                             </select>
                         </div>
+                        <div class="setting-help">Shows the numeric dashboard address whenever the camera connects or reconnects.</div>
                     </div>
                     <div class="setting-group">
                         <button class="button" onclick="showDashboardQr()" type="button">show dashboard QR</button>
@@ -1319,16 +1620,16 @@ async def dashboard():
 
                 </div>
 
-                <div class="settings-section">
+                <div class="settings-section settings-updates">
                     <h3>software updates</h3>
                     <div class="setting-group">
                         <button class="button" id="update-check-btn" onclick="checkForUpdates()" type="button">check for updates</button>
                         <button class="button" id="update-install-btn" onclick="installUpdate()" type="button" style="display: none;">install update</button>
-                        <div class="setting-help" id="update-status">Updates use the git repo and preserve ignored user data like settings and photos.</div>
+                        <div class="setting-help" id="update-status">Updates code, dependencies, and service files while preserving settings and photos.</div>
                     </div>
                 </div>
 
-                <div class="settings-section">
+                <div class="settings-section settings-extensions">
                     <h3>extensions</h3>
                     <div class="setting-group">
                         <div>
@@ -1356,20 +1657,18 @@ async def dashboard():
                         <button class="reset-btn" id="arena-clear-token-btn" onclick="clearArenaToken()" type="button">clear are.na token</button>
                     </div>
                 </div>
-                
-                <div class="settings-actions">
-                    <button class="save-btn" onclick="saveSettings()">save settings</button>
-                    <button class="reset-btn" onclick="resetSettings()">reset to defaults</button>
                 </div>
                 
-                <div class="settings-actions" style="margin-top: 20px; border-top: 1px solid var(--secondary-color); padding-top: 20px;">
-                    <div id="download-controls" style="align-items: center; margin-bottom: 15px;">
-                        <button class="button" onclick="downloadAllPhotos()" style="padding: 12px 20px; min-width: 160px;">download all photos</button>
-                        <button class="button" onclick="abortDownload()" id="abort-btn" style="background: #d32f2f; display: none; padding: 12px 20px; min-width: 140px;">abort download</button>
+                <div class="settings-footer-actions">
+                    <button class="save-btn" onclick="saveSettings()">save settings</button>
+                    <button class="reset-btn" onclick="resetSettings()">reset to defaults</button>
+                    <div id="download-controls">
+                        <button class="button" onclick="downloadAllPhotos()">download all photos</button>
+                        <button class="button danger-btn" onclick="abortDownload()" id="abort-btn" style="display: none;">abort download</button>
                     </div>
-                    <div id="delete-controls" style="align-items: center;">
-                        <button class="button" onclick="deleteAllPhotos()" style="background: #d32f2f; padding: 12px 20px; min-width: 160px;">delete all photos</button>
-                        <button class="button" onclick="abortDelete()" id="abort-delete-btn" style="background: #d32f2f; display: none; padding: 12px 20px; min-width: 140px;">abort deletion</button>
+                    <div id="delete-controls">
+                        <button class="button danger-btn" onclick="deleteAllPhotos()">delete all photos</button>
+                        <button class="button danger-btn" onclick="abortDelete()" id="abort-delete-btn" style="display: none;">abort deletion</button>
                     </div>
                 </div>
             </div>
@@ -1378,9 +1677,13 @@ async def dashboard():
         <script>
             let photos = [];
             let pagination = {};
-            let currentPage = 1;
+            const requestedInitialPage = parseInt(new URLSearchParams(window.location.search).get('page'), 10);
+            let currentPage = Number.isInteger(requestedInitialPage) && requestedInitialPage > 0 ? requestedInitialPage : 1;
+            let latestPhotoLoadRequest = 0;
             let extensionActions = [];
             let arenaTokenShouldClear = false;
+            let settingsFormSnapshot = null;
+            let settingsPageScrollY = 0;
             const photosPerPage = 12;  // Show 12 photos per page
             
             // Function to notify backend of user activity
@@ -1392,20 +1695,36 @@ async def dashboard():
                 }
             }
             
-            async function loadPhotos(page = 1) {
+            async function loadPhotos(page = currentPage) {
+                const requestedPage = Math.max(1, parseInt(page, 10) || 1);
+                const requestId = ++latestPhotoLoadRequest;
                 try {
-                    notifyUserActivity(); // Track gallery interaction
                     await loadExtensionActions();
-                    const response = await fetch(`/api/photos?page=${page}&limit=${photosPerPage}`);
+                    const response = await fetch(`/api/photos?page=${requestedPage}&limit=${photosPerPage}`);
                     if (!response.ok) {
                         // Server returned an error — skip this poll, will retry
                         console.log('Photos API returned', response.status, '— will retry');
                         return;
                     }
                     const data = await response.json();
+
+                    // Ignore older refreshes that finished after a newer page request.
+                    if (requestId !== latestPhotoLoadRequest) {
+                        return;
+                    }
+
+                    const nextPagination = data.pagination || {};
+                    const totalPages = Math.max(1, nextPagination.total_pages || 1);
+                    if (requestedPage > totalPages) {
+                        loadPhotos(totalPages);
+                        return;
+                    }
+
                     photos = data.photos || [];
-                    pagination = data.pagination || {};
-                    currentPage = page;
+                    pagination = nextPagination;
+                    currentPage = requestedPage;
+                    updatePageUrl();
+
                     renderGallery();
                     updatePhotoCount();
                     renderPagination();
@@ -1523,6 +1842,7 @@ async def dashboard():
                 const paginationInfo = document.getElementById('pagination-info');
                 const prevBtn = document.getElementById('prev-btn');
                 const nextBtn = document.getElementById('next-btn');
+                const pageJumpInput = document.getElementById('page-jump-input');
                 
                 if (!pagination || pagination.total_pages <= 1) {
                     paginationDiv.style.display = 'none';
@@ -1534,6 +1854,8 @@ async def dashboard():
                 // Update navigation buttons
                 prevBtn.disabled = !pagination.has_prev;
                 nextBtn.disabled = !pagination.has_next;
+                pageJumpInput.max = pagination.total_pages;
+                pageJumpInput.value = currentPage;
                 
                 // Update pagination info
                 const startItem = ((currentPage - 1) * photosPerPage) + 1;
@@ -1557,7 +1879,7 @@ async def dashboard():
                     if (startPage > 2) {
                         const ellipsis = document.createElement('span');
                         ellipsis.textContent = '...';
-                        ellipsis.className = 'pagination-info';
+                        ellipsis.className = 'pagination-ellipsis';
                         pageNumbersDiv.appendChild(ellipsis);
                     }
                 }
@@ -1572,7 +1894,7 @@ async def dashboard():
                     if (endPage < pagination.total_pages - 1) {
                         const ellipsis = document.createElement('span');
                         ellipsis.textContent = '...';
-                        ellipsis.className = 'pagination-info';
+                        ellipsis.className = 'pagination-ellipsis';
                         pageNumbersDiv.appendChild(ellipsis);
                     }
                     addPageButton(pagination.total_pages);
@@ -1593,7 +1915,33 @@ async def dashboard():
                     loadPhotos(page);
                 }
             }
-            
+
+            function jumpToPage(event) {
+                event.preventDefault();
+                const input = document.getElementById('page-jump-input');
+                const requestedPage = parseInt(input.value, 10);
+                if (!Number.isInteger(requestedPage)) {
+                    input.value = currentPage;
+                    return;
+                }
+                const targetPage = Math.min(Math.max(requestedPage, 1), pagination.total_pages);
+                if (targetPage === currentPage) {
+                    input.value = currentPage;
+                    return;
+                }
+                changePage(targetPage);
+            }
+
+            function updatePageUrl() {
+                const url = new URL(window.location.href);
+                if (currentPage === 1) {
+                    url.searchParams.delete('page');
+                } else {
+                    url.searchParams.set('page', currentPage);
+                }
+                window.history.replaceState({}, '', url);
+            }
+
             function setupPhotoCardHandlers() {
                 const photoCards = document.querySelectorAll('.photo-card');
                 
@@ -1759,8 +2107,7 @@ async def dashboard():
                     if (response.ok) {
                         const result = await response.json();
                         alert(result.message);
-                        // Refresh gallery to show new photo (go to first page since new photos appear first)
-                        loadPhotos(1);
+                        loadPhotos(currentPage);
                     } else {
                         const error = await response.json();
                         alert(`Error: ${error.detail}`);
@@ -1809,14 +2156,59 @@ async def dashboard():
                     const settings = await response.json();
                     populateSettingsForm(settings);
                     document.getElementById('settings-modal').style.display = 'block';
+                    lockSettingsPageScroll();
                 } catch (error) {
                     console.error('Error loading settings:', error);
                     alert('Error loading settings');
                 }
             }
             
-            function closeSettings() {
+            function closeSettings(force = false) {
+                if (!force && hasUnsavedSettings()) {
+                    const shouldClose = confirm('You have unsaved settings. Close without saving?');
+                    if (!shouldClose) {
+                        return false;
+                    }
+                }
                 document.getElementById('settings-modal').style.display = 'none';
+                unlockSettingsPageScroll();
+                settingsFormSnapshot = null;
+                return true;
+            }
+
+            function lockSettingsPageScroll() {
+                if (document.body.classList.contains('settings-open')) {
+                    return;
+                }
+                settingsPageScrollY = window.scrollY;
+                document.documentElement.classList.add('settings-open');
+                document.body.classList.add('settings-open');
+                document.body.style.top = `-${settingsPageScrollY}px`;
+            }
+
+            function unlockSettingsPageScroll() {
+                if (!document.body.classList.contains('settings-open')) {
+                    return;
+                }
+                document.documentElement.classList.remove('settings-open');
+                document.body.classList.remove('settings-open');
+                document.body.style.top = '';
+                window.scrollTo(0, settingsPageScrollY);
+            }
+
+            function getSettingsFormSnapshot() {
+                const controls = document.querySelectorAll(
+                    '#settings-modal input.setting-input, #settings-modal select.setting-input'
+                );
+                return JSON.stringify({
+                    values: Array.from(controls).map(control => [control.id, control.value]),
+                    arenaTokenShouldClear
+                });
+            }
+
+            function hasUnsavedSettings() {
+                return settingsFormSnapshot !== null
+                    && settingsFormSnapshot !== getSettingsFormSnapshot();
             }
             
             function populateSettingsForm(settings) {
@@ -1843,8 +2235,8 @@ async def dashboard():
                 document.getElementById('auto-refresh-interval').value = settings.system.auto_refresh_interval;
                 document.getElementById('auto-timeout-enabled').value = settings.system.auto_timeout_enabled ? 'true' : 'false';
                 document.getElementById('auto-timeout-minutes').value = settings.system.auto_timeout_minutes || 10;
-                document.getElementById('show-dashboard-qr-on-first-network').value = settings.system.show_dashboard_qr_on_first_network !== false ? 'true' : 'false';
-                document.getElementById('update-status').textContent = 'Updates use the git repo and preserve ignored user data like settings and photos.';
+                document.getElementById('show-dashboard-qr-on-wifi-connect').value = settings.system.show_dashboard_qr_on_wifi_connect !== false ? 'true' : 'false';
+                document.getElementById('update-status').textContent = 'Updates code, dependencies, and service files while preserving settings and photos.';
                 document.getElementById('update-install-btn').style.display = 'none';
 
                 const arenaSettings = (settings.extensions && settings.extensions.arena) || {};
@@ -1853,6 +2245,7 @@ async def dashboard():
                 document.getElementById('arena-access-token').value = '';
                 arenaTokenShouldClear = false;
                 updateArenaTokenStatus(Boolean(arenaSettings.access_token_configured));
+                settingsFormSnapshot = getSettingsFormSnapshot();
             }
 
             function updateArenaTokenStatus(configured) {
@@ -1967,7 +2360,7 @@ async def dashboard():
                             auto_refresh_interval: parseInt(document.getElementById('auto-refresh-interval').value),
                             auto_timeout_enabled: document.getElementById('auto-timeout-enabled').value === 'true',
                             auto_timeout_minutes: parseInt(document.getElementById('auto-timeout-minutes').value),
-                            show_dashboard_qr_on_first_network: document.getElementById('show-dashboard-qr-on-first-network').value === 'true'
+                            show_dashboard_qr_on_wifi_connect: document.getElementById('show-dashboard-qr-on-wifi-connect').value === 'true'
                         },
                         extensions: {
                             arena: {
@@ -1988,8 +2381,9 @@ async def dashboard():
                     });
                     
                     if (response.ok) {
+                        settingsFormSnapshot = getSettingsFormSnapshot();
                         alert('Settings saved successfully!');
-                        closeSettings();
+                        closeSettings(true);
                         // Update auto-refresh interval if changed
                         updateAutoRefreshInterval();
                         await loadExtensionActions();
@@ -2026,7 +2420,7 @@ async def dashboard():
                                 auto_refresh_interval: 30,
                                 auto_timeout_enabled: true,
                                 auto_timeout_minutes: 10,
-                                show_dashboard_qr_on_first_network: true
+                                show_dashboard_qr_on_wifi_connect: true
                             },
                             extensions: {
                                 arena: {
@@ -2075,7 +2469,10 @@ async def dashboard():
                     .then(settings => {
                         const intervalSeconds = settings.system.auto_refresh_interval;
                         if (intervalSeconds > 0) {
-                            autoRefreshInterval = setInterval(loadPhotos, intervalSeconds * 1000);
+                            autoRefreshInterval = setInterval(
+                                () => loadPhotos(currentPage),
+                                intervalSeconds * 1000
+                            );
                         }
                     })
                     .catch(error => console.error('Error updating auto-refresh:', error));
@@ -2099,6 +2496,96 @@ async def dashboard():
                 notifyUserActivity(); // Track refresh interaction
                 loadPhotos(currentPage);
             }
+
+            function formatDownloadSize(bytes) {
+                if (!Number.isFinite(bytes) || bytes <= 0) {
+                    return '';
+                }
+                const units = ['B', 'KB', 'MB', 'GB'];
+                const unitIndex = Math.min(
+                    Math.floor(Math.log(bytes) / Math.log(1024)),
+                    units.length - 1
+                );
+                const value = bytes / Math.pow(1024, unitIndex);
+                return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+            }
+
+            function resetDownloadButton(downloadBtn) {
+                downloadBtn.dataset.ready = 'false';
+                delete downloadBtn.dataset.downloadSize;
+                downloadBtn.textContent = 'download all photos';
+                downloadBtn.disabled = false;
+                downloadBtn.style.opacity = '1';
+            }
+
+            function handleDownloadError(downloadBtn, abortBtn, error) {
+                console.error('Error downloading photos:', error);
+                alert(`Error: ${error.message}`);
+                if (downloadBtn) {
+                    resetDownloadButton(downloadBtn);
+                }
+                if (abortBtn) {
+                    abortBtn.style.display = 'none';
+                }
+            }
+
+            function startPreparedZipDownload(downloadBtn, size = '') {
+                downloadBtn.dataset.ready = 'false';
+                downloadBtn.textContent = size
+                    ? `downloading ${size} in browser...`
+                    : 'downloading in browser...';
+                downloadBtn.disabled = true;
+                downloadBtn.style.opacity = '0.7';
+
+                const link = document.createElement('a');
+                link.href = '/api/photos/download-all/result';
+                link.download = `reframe-photos-${new Date().toISOString().split('T')[0]}.zip`;
+                link.style.display = 'none';
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+
+                monitorBrowserDownload(downloadBtn);
+            }
+
+            async function monitorBrowserDownload(downloadBtn, attempts = 0) {
+                try {
+                    const response = await fetch('/api/photos/download-all/progress');
+                    if (!response.ok) {
+                        throw new Error('Could not check download status');
+                    }
+                    const progress = await response.json();
+
+                    if (progress.status === 'idle') {
+                        downloadBtn.textContent = 'download sent to browser';
+                        setTimeout(() => resetDownloadButton(downloadBtn), 2000);
+                        return;
+                    }
+                    if (progress.status === 'completed' && attempts >= 3) {
+                        const size = formatDownloadSize(progress.size_bytes);
+                        downloadBtn.textContent = size
+                            ? `download ZIP (${size})`
+                            : 'download ZIP';
+                        downloadBtn.dataset.ready = 'true';
+                        downloadBtn.dataset.downloadSize = size;
+                        downloadBtn.disabled = false;
+                        downloadBtn.style.opacity = '1';
+                        return;
+                    }
+                    if (progress.status === 'error' || progress.status === 'aborted') {
+                        throw new Error(progress.message || 'Download failed');
+                    }
+                    if (attempts >= 600) {
+                        throw new Error('Browser download timed out');
+                    }
+
+                    setTimeout(() => monitorBrowserDownload(downloadBtn, attempts + 1), 1000);
+                } catch (error) {
+                    console.error('Browser download error:', error);
+                    downloadBtn.textContent = 'download failed';
+                    setTimeout(() => resetDownloadButton(downloadBtn), 2500);
+                }
+            }
             
             async function downloadAllPhotos() {
                 try {
@@ -2107,8 +2594,11 @@ async def dashboard():
                     // Find the download button and show loading state
                     const downloadBtn = document.querySelector('button[onclick="downloadAllPhotos()"]');
                     const abortBtn = document.getElementById('abort-btn');
+                    if (downloadBtn && downloadBtn.dataset.ready === 'true') {
+                        startPreparedZipDownload(downloadBtn, downloadBtn.dataset.downloadSize || '');
+                        return;
+                    }
                     if (downloadBtn) {
-                        const originalText = downloadBtn.textContent;
                         downloadBtn.textContent = 'starting download...';
                         downloadBtn.disabled = true;
                         downloadBtn.style.opacity = '0.7';
@@ -2134,7 +2624,7 @@ async def dashboard():
                     
                     // Poll for progress
                     let attempts = 0;
-                    const maxAttempts = 600; // 5 minutes max
+                    const maxAttempts = 600; // 10 minutes max
                     
                     window.progressInterval = setInterval(async () => {
                         attempts++;
@@ -2149,7 +2639,6 @@ async def dashboard():
                                         const percent = Math.round((progress.processed / progress.total) * 100);
                                         downloadBtn.textContent = `${progress.message} (${percent}%)`;
                                     } else if (progress.status === 'completed') {
-                                        downloadBtn.textContent = 'download ready!';
                                         clearInterval(window.progressInterval);
                                         window.progressInterval = null;
                                         
@@ -2157,54 +2646,16 @@ async def dashboard():
                                         if (abortBtn) {
                                             abortBtn.style.display = 'none';
                                         }
-                                        
-                                        // Download the file with better error handling
-                                        try {
-                                            console.log('Starting file download...');
-                                            const resultResponse = await fetch('/api/photos/download-all/result');
-                                            console.log('Download response status:', resultResponse.status);
-                                            
-                                            if (resultResponse.ok) {
-                                                const blob = await resultResponse.blob();
-                                                console.log('Blob size:', blob.size);
-                                                
-                                                const url = window.URL.createObjectURL(blob);
-                                                const a = document.createElement('a');
-                                                a.href = url;
-                                                a.download = `reframe-photos-${new Date().toISOString().split('T')[0]}.zip`;
-                                                a.style.display = 'none';
-                                                document.body.appendChild(a);
-                                                a.click();
-                                                window.URL.revokeObjectURL(url);
-                                                document.body.removeChild(a);
-                                                
-                                                console.log('Download triggered successfully');
-                                                downloadBtn.textContent = 'download complete!';
-                                                setTimeout(() => {
-                                                    if (downloadBtn) {
-                                                        downloadBtn.textContent = originalText;
-                                                        downloadBtn.disabled = false;
-                                                        downloadBtn.style.opacity = '1';
-                                                    }
-                                                }, 2000);
-                                            } else {
-                                                const errorText = await resultResponse.text();
-                                                console.error('Download failed:', resultResponse.status, errorText);
-                                                throw new Error(`Failed to download file: ${resultResponse.status}`);
-                                            }
-                                        } catch (downloadError) {
-                                            console.error('Download error:', downloadError);
-                                            throw downloadError;
-                                        }
+
+                                        const size = formatDownloadSize(progress.size_bytes);
+                                        startPreparedZipDownload(downloadBtn, size);
                                     } else if (progress.status === 'aborted') {
                                         clearInterval(window.progressInterval);
                                         window.progressInterval = null;
                                         downloadBtn.textContent = 'download aborted';
                                         setTimeout(() => {
                                             if (downloadBtn) {
-                                                downloadBtn.textContent = originalText;
-                                                downloadBtn.disabled = false;
-                                                downloadBtn.style.opacity = '1';
+                                                resetDownloadButton(downloadBtn);
                                             }
                                             if (abortBtn) {
                                                 abortBtn.style.display = 'none';
@@ -2221,32 +2672,26 @@ async def dashboard():
                         } catch (error) {
                             clearInterval(window.progressInterval);
                             window.progressInterval = null;
-                            throw error;
+                            handleDownloadError(downloadBtn, abortBtn, error);
+                            return;
                         }
                         
                         // Timeout after max attempts
                         if (attempts >= maxAttempts) {
                             clearInterval(window.progressInterval);
                             window.progressInterval = null;
-                            throw new Error('Download timed out after 5 minutes');
+                            handleDownloadError(
+                                downloadBtn,
+                                abortBtn,
+                                new Error('Download timed out after 10 minutes')
+                            );
                         }
                     }, 1000); // Check progress every second
                     
                 } catch (error) {
-                    console.error('Error downloading photos:', error);
-                    alert(`Error: ${error.message}`);
-                    
-                    // Reset button on error
                     const downloadBtn = document.querySelector('button[onclick="downloadAllPhotos()"]');
                     const abortBtn = document.getElementById('abort-btn');
-                    if (downloadBtn) {
-                        downloadBtn.textContent = 'download all photos';
-                        downloadBtn.disabled = false;
-                        downloadBtn.style.opacity = '1';
-                    }
-                    if (abortBtn) {
-                        abortBtn.style.display = 'none';
-                    }
+                    handleDownloadError(downloadBtn, abortBtn, error);
                 }
             }
             
@@ -2484,7 +2929,7 @@ async def dashboard():
             
             // Load photos on page load
             document.addEventListener('DOMContentLoaded', function() {
-                loadPhotos();
+                loadPhotos(currentPage);
                 updateAutoRefreshInterval();
                 updateBatteryLevel();
                 
@@ -2493,6 +2938,14 @@ async def dashboard():
                 
                 // Update battery level every 30 seconds
                 setInterval(updateBatteryLevel, 30000);
+            });
+
+            window.addEventListener('beforeunload', function(event) {
+                const modal = document.getElementById('settings-modal');
+                if (modal.style.display === 'block' && hasUnsavedSettings()) {
+                    event.preventDefault();
+                    event.returnValue = '';
+                }
             });
             
             async function updateBatteryLevel() {
@@ -2582,95 +3035,6 @@ async def list_photos(page: int = 1, limit: int = 20):
         },
     }
 
-@app.get("/api/photos/download-all")
-async def download_all_photos():
-    """Download all photos as a ZIP file."""
-    import zipfile
-    import tempfile
-    from fastapi.responses import StreamingResponse
-    import io
-    import asyncio
-    import aiofiles
-    
-    try:
-        # Get all photos from hardware service (these have absolute paths)
-        all_photos = await reframe_client.get("/photos")
-        
-        if not all_photos:
-            raise HTTPException(status_code=404, detail="No photos found")
-        
-        # Create temporary file for better performance
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
-            temp_path = temp_file.name
-        
-        # Create ZIP file with streaming
-        async def create_zip_stream():
-            with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
-                total_photos = len(all_photos)
-                processed = 0
-                
-                for photo in all_photos:
-                    try:
-                        # Add original photo - use the absolute path from hardware service
-                        if photo.get("original_path"):
-                            original_file_path = photo["original_path"]  # This is already an absolute path
-                            if os.path.exists(original_file_path):
-                                # Get just the filename for the ZIP
-                                from os.path import basename
-                                filename = basename(original_file_path)
-                                zip_file.write(original_file_path, f"original/{filename}")
-                        
-                        # Add dithered photo if available - use the absolute path from hardware service
-                        if photo.get("dithered_path"):
-                            dithered_file_path = photo["dithered_path"]  # This is already an absolute path
-                            if os.path.exists(dithered_file_path):
-                                # Get just the filename for the ZIP
-                                from os.path import basename
-                                filename = basename(dithered_file_path)
-                                zip_file.write(dithered_file_path, f"dithered/{filename}")
-                        
-                        processed += 1
-                        
-                        # Yield control more frequently for better responsiveness
-                        if processed % 2 == 0:
-                            await asyncio.sleep(0.005)  # Even smaller delay
-                                
-                    except Exception as e:
-                        print(f"Error adding photo {photo.get('id', 'unknown')} to ZIP: {e}")
-                        processed += 1
-                        continue
-        
-        # Create ZIP in background
-        await create_zip_stream()
-        
-        # Stream the file back
-        async def file_stream():
-            async with aiofiles.open(temp_path, 'rb') as f:
-                while chunk := await f.read(8192):  # 8KB chunks
-                    yield chunk
-            
-            # Clean up temp file
-            try:
-                os.unlink(temp_path)
-            except:
-                pass
-        
-        # Return streaming response
-        return StreamingResponse(
-            file_stream(),
-            media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename=reframe-photos-{datetime.now().strftime('%Y%m%d')}.zip"}
-        )
-        
-    except Exception as e:
-        # Clean up temp file on error
-        try:
-            if 'temp_path' in locals():
-                os.unlink(temp_path)
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=f"Failed to create download: {str(e)}")
-
 @app.get("/api/photos/{photo_id}")
 async def get_photo_info(photo_id: str):
     """Get information about a specific photo from the hardware service."""
@@ -2712,18 +3076,32 @@ async def update_settings(request: Request):
     """Update settings and notify the hardware service to reload/apply."""
     try:
         settings_data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Settings body must be valid JSON")
+
+    previous_settings = settings_manager.load_settings()
+    try:
         success = settings_manager.save_settings(settings_data)
-        if success:
-            try:
-                await reframe_client.post("/settings/reload")
-            except Exception:
-                # Hardware service might be down; still consider settings saved
-                pass
-            return {"status": "success", "message": "Settings updated successfully"}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to save settings")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid settings data: {str(e)}")
+    except SettingsValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to save settings")
+
+    try:
+        await reframe_client.post("/settings/reload")
+    except Exception as apply_error:
+        try:
+            settings_manager.replace_settings(previous_settings)
+            await reframe_client.post("/settings/reload")
+        except Exception as rollback_error:
+            logging.error(f"Settings rollback failed: {rollback_error}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Camera rejected the settings; previous settings were restored: {apply_error}"
+        )
+
+    return {"status": "success", "message": "Settings updated successfully"}
 
 @app.get("/api/update/status")
 async def update_status():
@@ -2732,10 +3110,10 @@ async def update_status():
 
 @app.post("/api/update/install")
 async def install_update():
-    """Install a fast-forward git update while leaving ignored user data untouched."""
+    """Pull a fast-forward update and apply its dependencies and service files."""
     status = await get_update_status(fetch=True)
 
-    if status["up_to_date"]:
+    if status["up_to_date"] and not status["post_install_pending"]:
         return {
             **status,
             "status": "success",
@@ -2754,21 +3132,52 @@ async def install_update():
             detail="Local code changes must be committed or discarded before updating"
         )
 
-    if not status["update_available"]:
+    if not status["update_available"] and not status["post_install_pending"]:
         raise HTTPException(status_code=409, detail="No automatic update is available")
 
-    backup_dir = backup_settings_for_update()
     preserved_paths = ignored_user_data_paths()
-    upstream = status["upstream"]
-    pull_args = ["pull", "--ff-only"]
-    if "/" in upstream:
-        remote, branch = upstream.split("/", 1)
-        pull_args.extend([remote, branch])
+    backup_dir = None
+    pull_output = ""
 
-    pull_result = await run_git(pull_args, timeout=180)
-    if pull_result["returncode"] != 0:
-        detail = git_error_detail(pull_result, "git pull failed")
-        raise HTTPException(status_code=500, detail=f"Could not install update: {detail}")
+    if not os.path.exists(UPDATE_HELPER_PATH):
+        raise HTTPException(
+            status_code=501,
+            detail="Update installer is missing. Run install.sh once over SSH to enable complete updates."
+        )
+
+    if status["update_available"]:
+        backup_dir = backup_settings_for_update()
+        upstream = status["upstream"]
+        pull_args = ["pull", "--ff-only"]
+        if "/" in upstream:
+            remote, branch = upstream.split("/", 1)
+            pull_args.extend([remote, branch])
+
+        pull_result = await run_git(pull_args, timeout=180)
+        if pull_result["returncode"] != 0:
+            detail = git_error_detail(pull_result, "git pull failed")
+            raise HTTPException(status_code=500, detail=f"Could not install update: {detail}")
+        pull_output = pull_result["stdout"]
+
+        pending_path = Path(UPDATE_PENDING_PATH)
+        pending_path.parent.mkdir(parents=True, exist_ok=True)
+        pending_path.write_text(status["remote_revision"] + "\n", encoding="utf-8")
+
+    apply_result = await run_repo_command(
+        ["sudo", "-n", UPDATE_HELPER_PATH],
+        timeout=300
+    )
+    if apply_result["returncode"] != 0:
+        detail = git_error_detail(apply_result, "post-update installation failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Code was updated, but installation did not finish: {detail}"
+        )
+
+    try:
+        os.unlink(UPDATE_PENDING_PATH)
+    except FileNotFoundError:
+        pass
 
     new_status = await get_update_status(fetch=False)
     message = "Update installed. Reboot the camera to finish."
@@ -2781,7 +3190,8 @@ async def install_update():
         "message": message,
         "backup_dir": backup_dir,
         "preserved_paths": preserved_paths,
-        "pull_output": pull_result["stdout"]
+        "pull_output": pull_output,
+        "apply_output": apply_result["stdout"]
     }
 
 @app.get("/api/extensions/actions")
@@ -2948,6 +3358,7 @@ async def reprocess_single_photo(photo_id: str):
 # Global variable to track download progress
 download_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
 download_abort = False
+download_job_active = False
 
 # Global variable to track delete progress
 delete_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
@@ -2956,8 +3367,11 @@ delete_abort = False
 @app.post("/api/photos/download-all/start")
 async def start_download_all(background_tasks: BackgroundTasks):
     """Start the download process and return immediately."""
-    global download_progress
+    global download_progress, download_job_active
     
+    if download_job_active or download_progress.get("status") in {"preparing", "creating", "completed", "downloading"}:
+        raise HTTPException(status_code=409, detail="A photo download is already in progress")
+
     try:
         # Get all photos from hardware service
         all_photos = await reframe_client.get("/photos")
@@ -2968,6 +3382,7 @@ async def start_download_all(background_tasks: BackgroundTasks):
         # Initialize progress
         global download_abort
         download_abort = False
+        download_job_active = True
         download_progress = {
             "status": "preparing",
             "processed": 0,
@@ -2980,7 +3395,10 @@ async def start_download_all(background_tasks: BackgroundTasks):
         
         return {"status": "started", "total_photos": len(all_photos)}
         
+    except HTTPException:
+        raise
     except Exception as e:
+        download_job_active = False
         download_progress = {"status": "error", "processed": 0, "total": 0, "message": str(e)}
         raise HTTPException(status_code=500, detail=f"Failed to start download: {str(e)}")
 
@@ -2995,6 +3413,12 @@ async def abort_download():
     """Abort the current download process."""
     global download_abort, download_progress
     download_abort = True
+    zip_path = download_progress.get("zip_path")
+    if download_progress.get("status") == "completed" and zip_path:
+        try:
+            os.unlink(zip_path)
+        except FileNotFoundError:
+            pass
     download_progress = {
         "status": "aborted",
         "processed": download_progress.get("processed", 0),
@@ -3022,112 +3446,118 @@ async def get_download_result():
         raise HTTPException(status_code=404, detail="ZIP file not found")
     
     print(f"Starting file stream for: {zip_path}")
-    
-    # Stream the file
-    async def file_stream():
-        try:
-            async with aiofiles.open(zip_path, 'rb') as f:
-                while chunk := await f.read(8192):  # 8KB chunks
-                    yield chunk
-            
-            print("File streaming completed")
-            
-            # Clean up
-            try:
-                os.unlink(zip_path)
-                download_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
-                print("Temporary file cleaned up")
-            except Exception as cleanup_error:
-                print(f"Cleanup error: {cleanup_error}")
-        except Exception as stream_error:
-            print(f"Streaming error: {stream_error}")
-            raise
-    
-    return StreamingResponse(
-        file_stream(),
+    download_progress["status"] = "downloading"
+
+    return FileResponse(
+        zip_path,
         media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=reframe-photos-{datetime.now().strftime('%Y%m%d')}.zip"}
+        filename=f"reframe-photos-{datetime.now().strftime('%Y%m%d')}.zip",
+        background=BackgroundTask(finish_download_archive, zip_path)
     )
 
-async def create_zip_background(all_photos):
-    """Background task to create ZIP file."""
-    global download_progress, download_abort
-    import tempfile
-    import zipfile
-    import asyncio
-    
+
+def finish_download_archive(zip_path):
+    """Remove an archive after the browser finishes or abandons its transfer."""
+    global download_progress
     try:
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
+        os.unlink(zip_path)
+        print("Temporary ZIP cleaned up after browser download")
+    except FileNotFoundError:
+        pass
+    except Exception as cleanup_error:
+        logging.warning(f"Could not clean up downloaded ZIP {zip_path}: {cleanup_error}")
+    finally:
+        if download_progress.get("status") in {"downloading", "aborted"}:
+            download_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
+
+
+def create_zip_file(all_photos, temp_path):
+    """Create the archive in a worker thread and report whether it completed."""
+    global download_progress, download_abort
+    import zipfile
+
+    download_progress["status"] = "creating"
+    download_progress["message"] = "Creating ZIP file..."
+    total_photos = len(all_photos)
+
+    with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
+        for processed, photo in enumerate(all_photos, start=1):
+            if download_abort:
+                return False
+
+            try:
+                original_path = photo.get("original_path")
+                if original_path and os.path.exists(original_path):
+                    zip_file.write(original_path, f"original/{os.path.basename(original_path)}")
+
+                dithered_path = photo.get("dithered_path")
+                if dithered_path and os.path.exists(dithered_path):
+                    zip_file.write(dithered_path, f"dithered/{os.path.basename(dithered_path)}")
+            except Exception as e:
+                print(f"Error adding photo {photo.get('id', 'unknown')} to ZIP: {e}")
+
+            if download_abort:
+                return False
+            download_progress["processed"] = processed
+            download_progress["message"] = f"Processing photo {processed}/{total_photos}"
+
+    return not download_abort
+
+
+def expire_download_archive(zip_path):
+    """Remove a completed archive if no browser claims it within ten minutes."""
+    global download_progress
+    if (
+        download_progress.get("status") == "completed"
+        and download_progress.get("zip_path") == zip_path
+    ):
+        try:
+            os.unlink(zip_path)
+        except FileNotFoundError:
+            pass
+        except Exception as cleanup_error:
+            logging.warning(f"Could not expire temporary ZIP {zip_path}: {cleanup_error}")
+            return
+        download_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
+
+
+async def create_zip_background(all_photos):
+    """Create one ZIP off the event loop and always clean incomplete files."""
+    global download_progress, download_job_active
+    temp_path = None
+    keep_archive = False
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temp_file:
             temp_path = temp_file.name
-        
-        download_progress["status"] = "creating"
-        download_progress["message"] = "Creating ZIP file..."
-        
-        # Create ZIP file
-        with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
-            total_photos = len(all_photos)
-            processed = 0
-            
-            for photo in all_photos:
-                # Check for abort
-                if download_abort:
-                    download_progress["status"] = "aborted"
-                    download_progress["message"] = "Download aborted by user"
-                    return
-                
-                try:
-                    # Add original photo
-                    if photo.get("original_path"):
-                        original_file_path = photo["original_path"]
-                        if os.path.exists(original_file_path):
-                            from os.path import basename
-                            filename = basename(original_file_path)
-                            zip_file.write(original_file_path, f"original/{filename}")
-                    
-                    # Add dithered photo
-                    if photo.get("dithered_path"):
-                        dithered_file_path = photo["dithered_path"]
-                        if os.path.exists(dithered_file_path):
-                            from os.path import basename
-                            filename = basename(dithered_file_path)
-                            zip_file.write(dithered_file_path, f"dithered/{filename}")
-                    
-                    processed += 1
-                    download_progress["processed"] = processed
-                    download_progress["message"] = f"Processing photo {processed}/{total_photos}"
-                    
-                    # Small delay for responsiveness
-                    if processed % 2 == 0:
-                        await asyncio.sleep(0.005)
-                        
-                except Exception as e:
-                    print(f"Error adding photo {photo.get('id', 'unknown')} to ZIP: {e}")
-                    processed += 1
-                    download_progress["processed"] = processed
-                    continue
-        
-        # Check for abort before marking as completed
-        if download_abort:
+
+        completed = await asyncio.to_thread(create_zip_file, all_photos, temp_path)
+        if not completed:
             download_progress["status"] = "aborted"
             download_progress["message"] = "Download aborted by user"
             return
-        
-        # Mark as completed
+
+        archive_size = os.path.getsize(temp_path)
         download_progress["status"] = "completed"
         download_progress["message"] = "ZIP file ready for download"
         download_progress["zip_path"] = temp_path
-        print(f"ZIP creation completed. File: {temp_path}, Size: {os.path.getsize(temp_path)} bytes")
-        
+        download_progress["size_bytes"] = archive_size
+        keep_archive = True
+        expiry_timer = threading.Timer(600, expire_download_archive, args=(temp_path,))
+        expiry_timer.daemon = True
+        expiry_timer.start()
+        print(f"ZIP creation completed. File: {temp_path}, Size: {archive_size} bytes")
     except Exception as e:
         download_progress["status"] = "error"
         download_progress["message"] = f"Error: {str(e)}"
-        # Clean up temp file on error
-        try:
-            if 'temp_path' in locals():
+    finally:
+        download_job_active = False
+        if temp_path and not keep_archive:
+            try:
                 os.unlink(temp_path)
-        except:
-            pass
+            except FileNotFoundError:
+                pass
+            except Exception as cleanup_error:
+                logging.warning(f"Could not remove temporary ZIP {temp_path}: {cleanup_error}")
 
 async def delete_photos_background(all_photos):
     """Background task to delete photos."""
