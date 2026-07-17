@@ -19,6 +19,29 @@ step()  { echo -e "\n${GREEN}── $1 ──${NC}"; }
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOOT_CONFIG="/boot/config.txt"
 [ -f "/boot/firmware/config.txt" ] && BOOT_CONFIG="/boot/firmware/config.txt"
+REQUIRED_USER="cam"
+REQUIRED_REPO="/home/cam/reframe"
+CURRENT_USER="$(id -un)"
+
+if [ "$(id -u)" -eq 0 ]; then
+    error "Do not run install.sh with sudo or as root."
+    error "Log in as '$REQUIRED_USER' and run: cd $REQUIRED_REPO && ./install.sh"
+    exit 1
+fi
+
+if [ "$CURRENT_USER" != "$REQUIRED_USER" ]; then
+    error "reFrame must currently be installed as the '$REQUIRED_USER' user."
+    error "The services and software updater use that account."
+    error "Re-flash or create the '$REQUIRED_USER' account, then clone the repo to $REQUIRED_REPO."
+    exit 1
+fi
+
+if [ "$SCRIPT_DIR" != "$REQUIRED_REPO" ]; then
+    error "reFrame must currently be cloned at $REQUIRED_REPO."
+    error "Current location: $SCRIPT_DIR"
+    error "Move or clone the repository to the required location, then run install.sh again."
+    exit 1
+fi
 
 echo ""
 echo "  ┌─────────────────────────────┐"
@@ -182,6 +205,13 @@ step "Setting up HDR script"
 
 chmod +x "$SCRIPT_DIR/enable_hdr.sh"
 info "enable_hdr.sh marked executable"
+
+# Install the narrow privileged helper used after dashboard git updates.
+sudo install -o root -g root -m 0755 "$SCRIPT_DIR/reframe-apply-update" /usr/local/sbin/reframe-apply-update
+echo "cam ALL=(root) NOPASSWD: /usr/local/sbin/reframe-apply-update" | sudo tee /etc/sudoers.d/reframe-update-helper > /dev/null
+sudo chmod 440 /etc/sudoers.d/reframe-update-helper
+sudo visudo -cf /etc/sudoers.d/reframe-update-helper > /dev/null
+info "Installed software update helper"
 
 # ── 9. Systemd services ─────────────────────
 step "Installing systemd services"
