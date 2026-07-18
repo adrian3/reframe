@@ -3,19 +3,24 @@ Description=Reframe Camera Service
 DefaultDependencies=no
 # Removed network dependency for fast boot - camera works without network
 After=local-fs.target systemd-udev-trigger.service
-Before=network.target shutdown.target
+Before=basic.target network.target shutdown.target
 Conflicts=shutdown.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=cam
 Group=cam
 WorkingDirectory=/home/cam/reframe
-# Enable Camera Module 3 HDR before Python opens Picamera2.
-ExecStartPre=/home/cam/reframe/enable_hdr.sh
+# Use maximum clock only for boot-critical imports/capture, then return to a
+# demand-based governor after READY=1 or whenever the service stops.
+ExecStartPre=+/bin/sh -c 'if grep -qw performance /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; fi; exit 0'
 ExecStart=/usr/bin/python3 /home/cam/reframe/reframe.py
+ExecStartPost=+/bin/sh -c 'if grep -qw ondemand /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo ondemand > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; elif grep -qw schedutil /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo schedutil > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; fi; exit 0'
+ExecStopPost=+/bin/sh -c 'if grep -qw ondemand /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo ondemand > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; elif grep -qw schedutil /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo schedutil > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; fi; exit 0'
 Restart=always
 RestartSec=5
+TimeoutStartSec=45
 StandardOutput=journal
 StandardError=journal
 

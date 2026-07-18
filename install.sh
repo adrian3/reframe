@@ -19,6 +19,8 @@ step()  { echo -e "\n${GREEN}── $1 ──${NC}"; }
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOOT_CONFIG="/boot/config.txt"
 [ -f "/boot/firmware/config.txt" ] && BOOT_CONFIG="/boot/firmware/config.txt"
+BOOT_CMDLINE="/boot/cmdline.txt"
+[ -f "/boot/firmware/cmdline.txt" ] && BOOT_CMDLINE="/boot/firmware/cmdline.txt"
 REQUIRED_USER="cam"
 REQUIRED_REPO="/home/cam/reframe"
 CURRENT_USER="$(id -un)"
@@ -176,8 +178,24 @@ ensure_exact_boot_config_line "dtoverlay=disable-bt"
 ensure_boot_config_line "dtparam=audio" "dtparam=audio=off"
 ensure_boot_config_line "hdmi_blanking" "hdmi_blanking=2"
 ensure_boot_config_line "boot_delay" "boot_delay=0"
+ensure_boot_config_line "display_auto_detect" "display_auto_detect=0"
+ensure_boot_config_line "disable_splash" "disable_splash=1"
+ensure_boot_config_line "disable_poe_fan" "disable_poe_fan=1"
+ensure_boot_config_line "force_eeprom_read" "force_eeprom_read=0"
+ensure_boot_config_line "enable_tvout" "enable_tvout=0"
 sudo sed -i 's/^dtparam=audio=on/#dtparam=audio=on # disabled by reFrame fast boot/' "$BOOT_CONFIG"
-info "Disabled Bluetooth overlay, audio, HDMI output, and boot delay in $BOOT_CONFIG"
+
+# Keep kernel messages in the journal while avoiding blocking serial-console
+# output and routine console chatter on this completely headless build.
+sudo sed -i -E 's/(^|[[:space:]])console=serial0,[^[:space:]]+//g; s/[[:space:]]+/ /g; s/^ //; s/ $//' "$BOOT_CMDLINE"
+if ! grep -qw "quiet" "$BOOT_CMDLINE"; then
+    sudo sed -i '1 s/$/ quiet/' "$BOOT_CMDLINE"
+fi
+if ! grep -qw "loglevel=3" "$BOOT_CMDLINE"; then
+    sudo sed -i '1 s/$/ loglevel=3/' "$BOOT_CMDLINE"
+fi
+
+info "Applied headless Bluetooth, audio, display-probe, console, and boot-delay trims"
 
 # ── 6. User permissions ─────────────────────
 step "Setting up user permissions"

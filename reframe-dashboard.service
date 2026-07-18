@@ -1,6 +1,6 @@
 [Unit]
 Description=Reframe Dashboard Service
-# Wait for camera to be ready AND network to be available for external WiFi debugging
+# reframe.service uses Type=notify, so this begins after startup capture dispatch.
 After=reframe.service network.target
 Wants=network.target
 Requires=reframe.service

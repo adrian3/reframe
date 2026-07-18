@@ -114,7 +114,7 @@ On Android/Pixel hotspots, `.local` hostnames may not resolve reliably. In that 
 
 ## HDR (Camera Module 3)
 
-HDR is automatically enabled at startup via `enable_hdr.sh` before Python opens Picamera2. To control it manually:
+HDR is automatically enabled at startup via `enable_hdr.sh` after Python imports finish but before Picamera2 opens the camera. This overlaps camera-device discovery with Python startup. To control it manually:
 
 ```bash
 # Enable
@@ -230,6 +230,8 @@ sudo reboot
 
 ### Boot-Speed Settings
 
+The camera service selects the `ondemand` CPU governor when the host supports it. This lets capture and image processing use the Pi's full clock under load while returning to its lower idle clock between photos.
+
 The installer optimizes for fastest boot-to-first-photo while keeping WiFi, SSH, mDNS, PiSugar, and camera capture working.
 
 It writes these headless hardware settings to the Pi boot config (`/boot/config.txt` on Bullseye, `/boot/firmware/config.txt` on Bookworm):
@@ -240,6 +242,11 @@ dtparam=audio=off
 hdmi_blanking=2
 boot_delay=0
 camera_auto_detect=1
+display_auto_detect=0
+disable_splash=1
+disable_poe_fan=1
+force_eeprom_read=0
+enable_tvout=0
 ```
 
 It also disables services and timers that are not needed for a headless camera:

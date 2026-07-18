@@ -77,6 +77,7 @@ BASE_PATH = os.path.dirname(os.path.realpath(__file__))
 SAVE_PATH = os.path.join(BASE_PATH, "photos")
 PROCESSED_PATH = os.path.join(BASE_PATH, "dithered_photos")
 RUNTIME_PATH = os.path.join(BASE_PATH, ".runtime")
+HDR_HELPER_PATH = os.path.join(BASE_PATH, "enable_hdr.sh")
 ORIGINAL_CAPTURE_EXTENSION = "jpg"
 DISPLAY_IMAGE_WIDTH = 600
 DISPLAY_IMAGE_HEIGHT = 400
@@ -84,6 +85,7 @@ DISPLAY_PANEL_WIDTH = 400
 DISPLAY_PANEL_HEIGHT = 600
 DISPLAY_IMAGE_SIZE = (DISPLAY_IMAGE_WIDTH, DISPLAY_IMAGE_HEIGHT)
 DISPLAY_PANEL_SIZE = (DISPLAY_PANEL_WIDTH, DISPLAY_PANEL_HEIGHT)
+BUTTON_POLL_INTERVAL_SECONDS = 0.025
 
 # Color palettes for dithering. We blend between the two to create a saturated look while preserving details.
 # Idea from https://github.com/pimoroni/inky
@@ -159,6 +161,54 @@ def _is_usable_lan_ip(ip_address):
     )
 
 
+def _enable_camera_hdr():
+    """Enable Camera Module 3 HDR after imports but before Picamera2 opens it."""
+    if not os.path.isfile(HDR_HELPER_PATH):
+        logging.warning("HDR helper not found at %s; continuing without HDR", HDR_HELPER_PATH)
+        return
+
+    try:
+        result = subprocess.run([HDR_HELPER_PATH], timeout=4, check=False)
+        if result.returncode != 0:
+            logging.warning("HDR helper exited with status %s", result.returncode)
+    except subprocess.TimeoutExpired:
+        logging.warning("HDR helper timed out; continuing without HDR")
+    except Exception as e:
+        logging.warning("Could not run HDR helper: %s", e)
+
+
+def _notify_systemd_ready(status):
+    """Tell systemd startup capture dispatch is complete."""
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        return
+
+    address = notify_socket
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
+            notifier.connect(address)
+            notifier.send(f"READY=1\nSTATUS={status}".encode("utf-8"))
+        logging.info("Notified systemd: %s", status)
+    except Exception as e:
+        logging.error("Could not notify systemd that startup is ready: %s", e)
+
+
+def _auto_display_enabled(settings_path):
+    """Read only the startup display flag before CameraManager is constructed."""
+    try:
+        with open(settings_path, "r") as settings_file:
+            settings = json.load(settings_file)
+        display_settings = settings.get("display", {})
+        if isinstance(display_settings, dict):
+            return display_settings.get("auto_display", True)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    return True
+
+
 def render_dashboard_qr_image(access_info):
     """Render a dashboard QR screen for the ePaper display."""
     Image, _ = _lazy_import_pil()
@@ -204,7 +254,7 @@ class CameraManager:
         self.settings_path = settings_path
         self.settings = self.load_settings()
         self.picam2 = Picamera2()
-        self.last_activity_time = time.time()
+        self.last_activity_monotonic = time.monotonic()
         self._has_captured = False  # Track if we've taken at least one photo (for adaptive AF)
         self.configure_camera()
 
@@ -379,7 +429,11 @@ class CameraManager:
 
     def update_activity_time(self):
         """Update the last activity timestamp."""
-        self.last_activity_time = time.time()
+        self.last_activity_monotonic = time.monotonic()
+
+    def get_inactivity_seconds(self):
+        """Return elapsed inactivity without being affected by clock corrections."""
+        return max(0, time.monotonic() - self.last_activity_monotonic)
 
     def is_timeout_enabled(self):
         """Check if auto-timeout is enabled in settings."""
@@ -395,7 +449,7 @@ class CameraManager:
             return False
 
         timeout_seconds = self.get_timeout_minutes() * 60
-        elapsed = time.time() - self.last_activity_time
+        elapsed = self.get_inactivity_seconds()
         return elapsed > timeout_seconds
 
     def shutdown_system(self):
@@ -429,9 +483,12 @@ class CameraManager:
     def _settle_autofocus(self, fast_mode=False):
         """Give autofocus a short settle window before capture."""
         self.update_activity_time()
+        autofocus_mode = self.settings.get("camera", {}).get("autofocus_mode", 2)
         if fast_mode:
             sleep(0.1)  # Shorter autofocus for startup
             logging.info("Fast autofocus mode: 0.1s delay")
+        elif self._has_captured and autofocus_mode == 2:
+            logging.info("Continuous autofocus already active: no settle delay")
         elif self._has_captured:
             sleep(0.1)  # Sensor already focused from previous capture
             logging.info("Adaptive autofocus: 0.1s delay (sensor pre-focused)")
@@ -478,7 +535,7 @@ class ImageProcessor:
         np = _lazy_import_numpy()
 
         import time
-        start_time = time.time()
+        start_time = time.monotonic()
 
         # Ensure the image is in RGB mode
         if image.mode != "RGB":
@@ -548,7 +605,7 @@ class ImageProcessor:
         distances = np.sum(diff * diff, axis=2)
         nearest_lut = np.argmin(distances, axis=1).astype(np.uint8)  # (32768,)
 
-        lut_time = time.time()
+        lut_time = time.monotonic()
         logging.info(f"LUT built in {(lut_time - start_time)*1000:.1f}ms")
 
         # --- Per-channel Bayer thresholds derived from palette spacing ---
@@ -590,7 +647,7 @@ class ImageProcessor:
         output_image = Image.fromarray(output_array, mode='P')
         output_image.putpalette(palette_flat)
 
-        end_time = time.time()
+        end_time = time.monotonic()
         logging.info(f"Ordered dithering completed in {(end_time - start_time)*1000:.1f}ms for {height}x{width} image")
 
         return output_image
@@ -660,7 +717,7 @@ class ImageProcessor:
         np = _lazy_import_numpy()
         Image, _ = _lazy_import_pil()
         import time
-        start_time = time.time()
+        start_time = time.monotonic()
 
         # Mapping from dither palette indices to hardware nibble indices.
         # Dither palette: 0:black, 1:white, 2:yellow, 3:red, 4:black, 5:blue, 6:green
@@ -681,7 +738,7 @@ class ImageProcessor:
             dithering_method, bayer_size, threshold_scale
         )
 
-        dither_time = time.time()
+        dither_time = time.monotonic()
 
         # Step 2: extract pixel indices and rotate if needed.
         # The processed image is landscape; the current panel expects portrait.
@@ -700,7 +757,7 @@ class ImageProcessor:
         buf = (hw_pixels[0::2].astype(np.uint8) << 4) + hw_pixels[1::2].astype(np.uint8)
         display_buffer = bytearray(buf.astype(np.uint8))
 
-        buffer_time = time.time()
+        buffer_time = time.monotonic()
         logging.info(f"dither_to_display_buffer: dither={((dither_time - start_time)*1000):.0f}ms, "
                      f"buffer={((buffer_time - dither_time)*1000):.0f}ms, "
                      f"total={((buffer_time - start_time)*1000):.0f}ms")
@@ -711,6 +768,12 @@ class ImageProcessor:
     def resize_image(image, size=DISPLAY_IMAGE_SIZE):
         """Resizes the image to the specified size."""
         Image, _ = _lazy_import_pil()
+        if image.size == (size[0] * 2, size[1] * 2) and hasattr(image, "reduce"):
+            # Preserve the 2x source capture and average each 2x2 block before
+            # dithering. This is faster than generic scaling and still provides
+            # a properly filtered high-resolution source.
+            return image.reduce(2)
+
         # Pillow >= 10 moved filters under Image.Resampling; older Pi builds keep them on Image.
         resampling_attr = getattr(Image, "Resampling", Image)
         resample_filter = getattr(resampling_attr, "BILINEAR", Image.BILINEAR)
@@ -1032,12 +1095,12 @@ class EInkDisplay:
             logging.info("Initializing e-ink display hardware...")
             import time
             from waveshare_epd import epd4in0e
-            start_time = time.time()
+            start_time = time.monotonic()
 
             self.epd = epd4in0e.EPD()
             self.epd.init()
 
-            init_time = time.time() - start_time
+            init_time = time.monotonic() - start_time
             logging.info(f"E-ink display ready in {init_time:.2f}s")
             self._initialized = True
 
@@ -1088,9 +1151,9 @@ class EInkDisplay:
             try:
                 self._ensure_initialized()
                 logging.info("Display refresh started (background)")
-                refresh_start = time.time()
+                refresh_start = time.monotonic()
                 self.epd.display(buffer)
-                refresh_time = time.time() - refresh_start
+                refresh_time = time.monotonic() - refresh_start
                 logging.info(f"Display refresh completed in {refresh_time:.1f}s")
             except Exception as e:
                 logging.error(f"Display refresh error: {e}")
@@ -1193,10 +1256,10 @@ class EInkDisplay:
 class CameraSystem:
     """Complete camera system that implements dashboard-like functionality."""
 
-    def __init__(self, settings_path="settings.json"):
+    def __init__(self, settings_path="settings.json", eink_display=None):
+        self.eink_display = eink_display if eink_display is not None else EInkDisplay()
         self.camera_manager = CameraManager(settings_path)
         self.file_manager = FileManager(SAVE_PATH, PROCESSED_PATH)
-        self.eink_display = EInkDisplay()
         self.timeout_thread = None
         self.timeout_running = False
         self._timeout_started = False
@@ -1215,9 +1278,7 @@ class CameraSystem:
             self.timeout_thread.start()
             self._timeout_started = True
             timeout_minutes = self.camera_manager.get_timeout_minutes()
-            current_time = time.time()
-            last_activity = self.camera_manager.last_activity_time
-            elapsed = current_time - last_activity
+            elapsed = self.camera_manager.get_inactivity_seconds()
             logging.info(f"Auto-timeout monitor started: {timeout_minutes} minutes timeout, last activity was {elapsed:.1f}s ago")
 
     def start_timeout_monitor_deferred(self):
@@ -1345,20 +1406,22 @@ class CameraSystem:
             photo_path = self.file_manager.get_new_file_path(SAVE_PATH, ORIGINAL_CAPTURE_EXTENSION)
             logging.info(f"Capturing photo to: {photo_path}")
 
-            pipeline_start = time.time()
+            display_settings = self.camera_manager.settings.get("display", {})
+            if display_settings.get("auto_display", True):
+                # Hide first-use GPIO/SPI initialization behind capture and
+                # image processing instead of delaying the physical refresh.
+                self.eink_display.prepare_async()
+
+            pipeline_start = time.monotonic()
             result, original_image = self.camera_manager.capture_image_with_metadata(photo_path, fast_mode=fast_mode)
 
             if result["success"]:
-                capture_time = time.time()
+                capture_time = time.monotonic()
                 logging.info(f"Photo captured successfully: {result['photo_id']} "
                              f"({((capture_time - pipeline_start)*1000):.0f}ms)")
 
                 processing_settings = self.camera_manager.settings.get("processing", {})
                 dithered_path = os.path.join(PROCESSED_PATH, f"{result['photo_id']}_dithered.png")
-
-                display_settings = self.camera_manager.settings.get("display", {})
-                if display_settings.get("auto_display", True):
-                    self.eink_display.prepare_async()
 
                 resized_image = ImageProcessor.resize_image(original_image)
 
@@ -1373,7 +1436,7 @@ class CameraSystem:
                     threshold_scale=processing_settings.get("threshold_scale", 1.0)
                 )
 
-                process_time = time.time()
+                process_time = time.monotonic()
                 logging.info(f"Dither+buffer complete ({((process_time - capture_time)*1000):.0f}ms)")
 
                 # Send to display ASAP (async — screen starts blinking immediately)
@@ -1381,7 +1444,7 @@ class CameraSystem:
                     logging.info("Sending to display (async)")
                     self.eink_display.display_buffer_async(display_buffer)
 
-                display_sent_time = time.time()
+                display_sent_time = time.monotonic()
                 logging.info(f"Total button-to-display: {((display_sent_time - pipeline_start)*1000):.0f}ms")
 
                 # Save files in background after the display refresh has been dispatched.
@@ -1642,7 +1705,7 @@ def _create_fastapi_routes():
         timeout_minutes = camera_system.camera_manager.get_timeout_minutes()
 
         if timeout_enabled:
-            elapsed = time.time() - camera_system.camera_manager.last_activity_time
+            elapsed = camera_system.camera_manager.get_inactivity_seconds()
             remaining_seconds = max(0, (timeout_minutes * 60) - elapsed)
             remaining_minutes = remaining_seconds / 60
         else:
@@ -1654,7 +1717,7 @@ def _create_fastapi_routes():
             "timeout_minutes": timeout_minutes,
             "remaining_seconds": remaining_seconds,
             "remaining_minutes": remaining_minutes,
-            "last_activity": camera_system.camera_manager.last_activity_time
+            "last_activity": time.time() - camera_system.camera_manager.get_inactivity_seconds()
         }
 
     @app.post("/api/display/clear")
@@ -1686,9 +1749,19 @@ def _start_api_server_in_background(host: str = "127.0.0.1", port: int = 8077):
 def main():
     global camera_system
 
-    camera_system = CameraSystem()
+    startup_display = EInkDisplay()
+    startup_settings_path = os.path.join(BASE_PATH, "settings.json")
+    if _auto_display_enabled(startup_settings_path):
+        startup_display.prepare_async()
+
+    # Python/Picamera2 imports happen before this point, overlapping the cold
+    # boot wait for the camera subdevice. HDR is still applied before the
+    # Picamera2 constructor opens the camera.
+    _enable_camera_hdr()
+    camera_system = CameraSystem(eink_display=startup_display)
     logging.info("Camera system initialized")
     logging.info("Taking startup photo...")
+    startup_status = "Camera initialized; startup capture failed"
     try:
         with _operation_lock:
             result = camera_system.capture_photo_api(fast_mode=True)
@@ -1698,6 +1771,7 @@ def main():
             if camera_system.camera_manager.settings.get("display", {}).get("auto_display", True):
                 logging.info("Startup photo sent to display")
             logging.info("System ready")
+            startup_status = "Startup photo dispatched"
 
             # Ensure activity time is updated before starting timeout monitor
             camera_system.update_activity()
@@ -1706,6 +1780,10 @@ def main():
             logging.warning("Failed to capture startup photo: %s", result.get("message", "unknown error"))
     except Exception as e:
         logging.error("Error taking startup photo: %s", e)
+    finally:
+        # reframe.service is Type=notify. Dashboard startup waits for this, but
+        # does not wait for the e-ink panel's long physical refresh.
+        _notify_systemd_ready(startup_status)
 
     # ═══════════════════════════════════════════════════════════════
     # HARDWARE: Button — PiSugar 3 via I2C
@@ -1749,13 +1827,13 @@ def main():
 
             # Button press started
             if current_state and not prev_state:
-                button_press_start_time = time.time()
+                button_press_start_time = time.monotonic()
                 logging.info("Button pressed - monitoring for long press protection...")
 
             # Button released
             elif not current_state and prev_state:
                 if button_press_start_time is not None:
-                    press_duration = time.time() - button_press_start_time
+                    press_duration = time.monotonic() - button_press_start_time
 
                     if press_duration < LONG_PRESS_THRESHOLD:
                         # Block captures while display is mid-refresh to avoid
@@ -1776,7 +1854,7 @@ def main():
                     button_press_start_time = None
 
             prev_state = current_state
-            sleep(0.1)
+            sleep(BUTTON_POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         logging.info("Program interrupted by user. Exiting...")
     finally:
