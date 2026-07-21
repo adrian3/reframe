@@ -1,7 +1,6 @@
 [Unit]
 Description=Reframe Camera Service
 DefaultDependencies=no
-# Removed network dependency for fast boot - camera works without network
 After=local-fs.target systemd-udev-trigger.service
 Before=basic.target network.target shutdown.target
 Conflicts=shutdown.target

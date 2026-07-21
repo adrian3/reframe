@@ -10,7 +10,7 @@ import shutil
 import math
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
@@ -749,13 +749,16 @@ class ArenaExtension(DashboardExtension):
 
         try:
             if isinstance(created, (int, float)):
-                dt = datetime.fromtimestamp(created)
+                dt = datetime.fromtimestamp(created, timezone.utc)
             elif isinstance(created, str):
                 normalized = created.replace("Z", "+00:00")
                 dt = datetime.fromisoformat(normalized)
             else:
                 return str(created)
-            return dt.strftime("%B %-d, %Y at %-I:%M %p")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.astimezone(timezone.utc)
+            return f'{dt.strftime("%B %-d, %Y at %-I:%M %p")} UTC'
         except Exception:
             return str(created)
 
@@ -1021,7 +1024,7 @@ async def dashboard():
                 flex-wrap: wrap;
                 justify-content: center;
             }
-            
+
             .action-btn {
                 padding: 8px 12px;
                 font-size: 0.9rem;
@@ -2006,10 +2009,6 @@ async def dashboard():
                 }
                 
                 return `${size.toFixed(1)} ${units[unitIndex]}`;
-            }
-            
-            function formatDate(isoString) {
-                return new Date(isoString).toLocaleDateString();
             }
             
             function viewPhoto(photoId) {

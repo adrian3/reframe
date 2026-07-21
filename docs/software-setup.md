@@ -70,6 +70,10 @@ echo "get anti_mistouch" | nc -q 0 127.0.0.1 8423
 
 > **Note:** reFrame reads the button directly via I2C (address `0x57`) for photo capture. PiSugar still handles battery monitoring, one-press power-on, and long-press shutdown.
 
+### PiSugar RTC
+
+The installer keeps the Raspberry Pi system clock and the PiSugar 3 real-time clock in UTC. reFrame synchronizes them automatically on startup: it syncs the system clock from the RTC, and whenever network time becomes available it updates both clocks.
+
 ## 4. Reboot
 
 ```bash
@@ -114,7 +118,7 @@ On Android/Pixel hotspots, `.local` hostnames may not resolve reliably. In that 
 
 ## HDR (Camera Module 3)
 
-HDR is automatically enabled at startup via `enable_hdr.sh` after Python imports finish but before Picamera2 opens the camera. This overlaps camera-device discovery with Python startup. To control it manually:
+HDR is automatically enabled at startup via `scripts/enable_hdr.sh` after Python imports finish but before Picamera2 opens the camera. This overlaps camera-device discovery with Python startup. To control it manually:
 
 ```bash
 # Enable
@@ -219,12 +223,18 @@ cp settings.example.json settings.json
 ### Systemd Services
 
 ```bash
-sudo cp reframe.service /etc/systemd/system/
-sudo cp reframe-dashboard.service /etc/systemd/system/
-sudo cp reframe-dashboard-proxy.service /etc/systemd/system/
+sudo cp systemd/reframe.service /etc/systemd/system/
+sudo cp systemd/reframe-dashboard.service /etc/systemd/system/
+sudo cp systemd/reframe-dashboard-proxy.service /etc/systemd/system/
+sudo cp systemd/reframe-rtc-restore.service /etc/systemd/system/
+sudo cp systemd/reframe-rtc-update.service /etc/systemd/system/
+sudo install -o root -g root -m 0755 scripts/reframe-rtc-sync /usr/local/sbin/reframe-rtc-sync
+sudo install -d -o root -g root -m 0755 /var/lib/reframe
+sudo timedatectl set-timezone UTC
+sudo timedatectl set-ntp true
 sudo systemctl daemon-reload
 sudo systemctl reenable reframe.service
-sudo systemctl enable reframe-dashboard.service reframe-dashboard-proxy.service
+sudo systemctl enable reframe-dashboard.service reframe-dashboard-proxy.service reframe-rtc-restore.service reframe-rtc-update.service
 sudo reboot
 ```
 

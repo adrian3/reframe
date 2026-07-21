@@ -71,24 +71,29 @@ A web dashboard, accessible over the local network, lets you browse photos, down
 
 ```
 reframe/
-├── reframe.py               # main camera application
-├── dashboard.py              # web dashboard for photo management
-├── install.sh                # one-command setup script
-├── reframe-apply-update      # privileged post-update installer
-├── settings.example.json     # default configuration
-├── enable_hdr.sh             # HDR initialization script
-├── dashboard_proxy.py        # local port 80 dashboard proxy
-├── waveshare_epd/            # e-ink display drivers
-├── hardware/                 # 3D-printable enclosure files
-├── docs/                     # build guide & software setup
-│   ├── build-guide.md
-│   ├── software-setup.md
-│   ├── hardware-porting.md
-│   ├── dashboard-extensions.md
-│   └── images/
-├── reframe.service           # systemd service (camera)
-├── reframe-dashboard.service       # systemd service (dashboard)
-└── reframe-dashboard-proxy.service # systemd service (friendly dashboard URL)
+├── reframe.py                 # main camera application
+├── dashboard.py               # web dashboard for photo management
+├── dashboard_proxy.py         # local port 80 dashboard proxy
+├── install.sh                 # one-command setup script
+├── settings.example.json      # default configuration
+├── scripts/                   # hardware and privileged system helpers
+│   ├── enable_hdr.sh
+│   ├── reframe-apply-update
+│   └── reframe-rtc-sync
+├── systemd/                   # camera, dashboard, and RTC service units
+│   ├── reframe.service
+│   ├── reframe-dashboard.service
+│   ├── reframe-dashboard-proxy.service
+│   ├── reframe-rtc-restore.service
+│   └── reframe-rtc-update.service
+├── waveshare_epd/             # e-ink display drivers
+├── hardware/                  # 3D-printable enclosure files
+└── docs/                      # build guide & software setup
+    ├── build-guide.md
+    ├── software-setup.md
+    ├── hardware-porting.md
+    ├── dashboard-extensions.md
+    └── images/
 ```
 
 

@@ -23,7 +23,7 @@ To port another camera:
 - Keep `capture_image_with_metadata()` returning `(result_dict, PIL_image)`.
 - Make `capture_image()` return a PIL `RGB` image.
 - Keep `configure_camera()`, `reload_settings()`, and `apply_camera_settings()` present, even if some settings become no-ops.
-- Update or remove `enable_hdr.sh` and the `_enable_camera_hdr()` startup call in `reframe.py` if your camera does not use Camera Module 3 HDR.
+- Update or remove `scripts/enable_hdr.sh` and the `_enable_camera_hdr()` startup call in `reframe.py` if your camera does not use Camera Module 3 HDR.
 - Update `settings.example.json` camera defaults for the resolution and controls your camera supports.
 
 ## Button And Power

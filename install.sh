@@ -221,11 +221,11 @@ info "Photo directories ready"
 # ── 8. HDR script ───────────────────────────
 step "Setting up HDR script"
 
-chmod +x "$SCRIPT_DIR/enable_hdr.sh"
+chmod +x "$SCRIPT_DIR/scripts/enable_hdr.sh"
 info "enable_hdr.sh marked executable"
 
 # Install the narrow privileged helper used after dashboard git updates.
-sudo install -o root -g root -m 0755 "$SCRIPT_DIR/reframe-apply-update" /usr/local/sbin/reframe-apply-update
+sudo install -o root -g root -m 0755 "$SCRIPT_DIR/scripts/reframe-apply-update" /usr/local/sbin/reframe-apply-update
 echo "cam ALL=(root) NOPASSWD: /usr/local/sbin/reframe-apply-update" | sudo tee /etc/sudoers.d/reframe-update-helper > /dev/null
 sudo chmod 440 /etc/sudoers.d/reframe-update-helper
 sudo visudo -cf /etc/sudoers.d/reframe-update-helper > /dev/null
@@ -234,18 +234,37 @@ info "Installed software update helper"
 # ── 9. Systemd services ─────────────────────
 step "Installing systemd services"
 
+# Install the PiSugar RTC synchronization helper and services.
+sudo install -o root -g root -m 0755 "$SCRIPT_DIR/scripts/reframe-rtc-sync" /usr/local/sbin/reframe-rtc-sync
+sudo cp "$SCRIPT_DIR/systemd/reframe-rtc-restore.service" /etc/systemd/system/reframe-rtc-restore.service
+sudo cp "$SCRIPT_DIR/systemd/reframe-rtc-update.service" /etc/systemd/system/reframe-rtc-update.service
+sudo chmod 644 \
+    /etc/systemd/system/reframe-rtc-restore.service \
+    /etc/systemd/system/reframe-rtc-update.service
+sudo install -d -o root -g root -m 0755 /var/lib/reframe
+sudo timedatectl set-timezone UTC
+sudo timedatectl set-ntp true
+
+# The TCP command API can change power and RTC settings and has no per-command
+# authentication. Keep the web UI reachable on 8421, but bind commands on 8423
+# to localhost; reFrame's helper uses PiSugar's root-only Unix socket.
+if [ -f /etc/default/pisugar-server ]; then
+    sudo sed -i -E 's|--tcp[[:space:]]+0\.0\.0\.0:8423|--tcp 127.0.0.1:8423|' /etc/default/pisugar-server
+fi
+info "Installed PiSugar RTC boot/network synchronization"
+
 # Install camera service
-sudo cp "$SCRIPT_DIR/reframe.service" /etc/systemd/system/reframe.service
+sudo cp "$SCRIPT_DIR/systemd/reframe.service" /etc/systemd/system/reframe.service
 sudo chmod 644 /etc/systemd/system/reframe.service
 info "Installed reframe.service"
 
 # Install dashboard service
-sudo cp "$SCRIPT_DIR/reframe-dashboard.service" /etc/systemd/system/reframe-dashboard.service
+sudo cp "$SCRIPT_DIR/systemd/reframe-dashboard.service" /etc/systemd/system/reframe-dashboard.service
 sudo chmod 644 /etc/systemd/system/reframe-dashboard.service
 info "Installed reframe-dashboard.service"
 
 # Install dashboard proxy service (port 80 -> 8000)
-sudo cp "$SCRIPT_DIR/reframe-dashboard-proxy.service" /etc/systemd/system/reframe-dashboard-proxy.service
+sudo cp "$SCRIPT_DIR/systemd/reframe-dashboard-proxy.service" /etc/systemd/system/reframe-dashboard-proxy.service
 sudo chmod 644 /etc/systemd/system/reframe-dashboard-proxy.service
 info "Installed reframe-dashboard-proxy.service"
 
@@ -254,6 +273,8 @@ sudo systemctl daemon-reload
 sudo systemctl reenable reframe.service
 sudo systemctl enable reframe-dashboard.service
 sudo systemctl enable reframe-dashboard-proxy.service
+sudo systemctl enable reframe-rtc-restore.service
+sudo systemctl enable reframe-rtc-update.service
 info "Services enabled (will start on boot)"
 
 # ── 10. Boot-speed service trims ─────────────

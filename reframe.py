@@ -77,7 +77,7 @@ BASE_PATH = os.path.dirname(os.path.realpath(__file__))
 SAVE_PATH = os.path.join(BASE_PATH, "photos")
 PROCESSED_PATH = os.path.join(BASE_PATH, "dithered_photos")
 RUNTIME_PATH = os.path.join(BASE_PATH, ".runtime")
-HDR_HELPER_PATH = os.path.join(BASE_PATH, "enable_hdr.sh")
+HDR_HELPER_PATH = os.path.join(BASE_PATH, "scripts", "enable_hdr.sh")
 ORIGINAL_CAPTURE_EXTENSION = "jpg"
 DISPLAY_IMAGE_WIDTH = 600
 DISPLAY_IMAGE_HEIGHT = 400
@@ -129,21 +129,20 @@ def get_dashboard_access_info(hostname=None, ip_address=None):
 
 
 def get_lan_ip_address():
-    """Return the first usable non-loopback IPv4 address, if available."""
+    """Return wlan0's usable IPv4 address, if it has one."""
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(1)
-            sock.connect(("8.8.8.8", 80))
-            ip_address = sock.getsockname()[0]
-            if _is_usable_lan_ip(ip_address):
-                return ip_address
-    except Exception:
-        pass
-
-    try:
-        result = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "dev", "wlan0", "scope", "global"],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
         if result.returncode == 0:
-            for ip_address in result.stdout.split():
+            fields = result.stdout.split()
+            for index, field in enumerate(fields[:-1]):
+                if field != "inet":
+                    continue
+                ip_address = fields[index + 1].split("/", 1)[0]
                 if _is_usable_lan_ip(ip_address):
                     return ip_address
     except Exception:

@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore system time from the PiSugar RTC after the startup photo
+Wants=pisugar-server.service
+After=reframe.service pisugar-server.service
+Before=reframe-rtc-update.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/reframe-rtc-sync restore
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target
