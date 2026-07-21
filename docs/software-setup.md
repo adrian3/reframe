@@ -13,7 +13,10 @@ Download and install [Raspberry Pi Imager](https://www.raspberrypi.com/software/
 - **WiFi:** enter your home network name and password. If you want to use the camera on the go, also add your phone's hotspot (you can add multiple networks)
 - **Services:** Enable SSH with password authentication
 
-Eject the card, insert it into the Pi Zero 2 W, and power it on.
+Eject the card, insert it into the Pi Zero 2 W, and power it on. On a new
+PiSugar 3, the first power-on may require a short press followed by a long
+press. The reFrame installer disables this accidental-touch prevention mode so
+later power-ons use a single press.
 
 ### Raspberry Pi OS Version
 

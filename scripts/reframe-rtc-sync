@@ -33,11 +33,38 @@ wait_for_pisugar() {
     return 1
 }
 
+configure_anti_mistouch() {
+    local current response verified
+
+    current="$(pisugar_command "get anti_mistouch" 2>/dev/null || true)"
+    if [ "$current" = "anti_mistouch: false" ] || [ "$current" = "false" ]; then
+        echo "PiSugar one-press power-on is already configured"
+        return 0
+    fi
+
+    response="$(pisugar_command "set_anti_mistouch false" 2>/dev/null || true)"
+    if [[ "$response" != *"done"* && "$response" != *"Done"* ]]; then
+        echo "PiSugar one-press power-on configuration failed: ${response:-no response}" >&2
+        return 1
+    fi
+
+    verified="$(pisugar_command "get anti_mistouch" 2>/dev/null || true)"
+    if [ "$verified" != "anti_mistouch: false" ] && [ "$verified" != "false" ]; then
+        echo "PiSugar one-press power-on verification failed: ${verified:-no response}" >&2
+        return 1
+    fi
+
+    echo "Configured PiSugar one-press power-on"
+}
+
 restore_from_rtc() {
     local rtc_response rtc_time rtc_epoch last_sync_epoch response
 
-    require_utc || return 0
     wait_for_pisugar || return 0
+    # This setting matters on the next power-on, so applying it here also
+    # covers fresh installs where I2C was not usable until after reboot.
+    configure_anti_mistouch || true
+    require_utc || return 0
     rtc_response="$(pisugar_command "get rtc_time" 2>/dev/null || true)"
     rtc_time="${rtc_response#*:}"
     rtc_time="${rtc_time# }"

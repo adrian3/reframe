@@ -67,6 +67,11 @@ sudo apt install -y -qq \
 
 info "System packages installed"
 
+step "Enabling I2C"
+
+sudo raspi-config nonint do_i2c 0
+info "I2C enabled"
+
 # ── 2. Python packages ──────────────────────
 step "Installing Python packages"
 
@@ -138,10 +143,6 @@ fi
 
 # ── 4. Enable hardware interfaces ───────────
 step "Enabling hardware interfaces"
-
-# Enable I2C
-sudo raspi-config nonint do_i2c 0
-info "I2C enabled"
 
 # Enable SPI
 sudo raspi-config nonint do_spi 0
