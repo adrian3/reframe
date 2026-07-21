@@ -109,6 +109,8 @@ If you used a different Pi hostname during Raspberry Pi Imager setup, replace `r
 
 Dashboard settings include a software update button for git-based installs. It checks the configured upstream repo, installs fast-forward updates only, preserves ignored user data such as your settings and photos, refreshes dependencies and service files, and asks you to reboot after a successful update.
 
+Advanced export settings include an optional 2× dithered-image mode. When enabled, dithered downloads and Are.na uploads are enlarged at export time to help them look sharp on social media. Original photos, stored dithered photos, gallery previews, display output, and download-all ZIP files are unchanged. This option is disabled by default.
+
 ### Using with a Phone Hotspot
 
 To use the camera without a WiFi network, enable your phone's hotspot. As long as you added the hotspot name and password during flashing (step 1), the Pi will connect to it automatically on boot.

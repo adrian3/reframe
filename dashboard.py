@@ -10,13 +10,15 @@ import shutil
 import math
 import tempfile
 import threading
+from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from starlette.background import BackgroundTask
 import httpx
+from PIL import Image
 
 CAMERA_AVAILABLE = False
 
@@ -33,6 +35,24 @@ os.makedirs(PHOTOS_PATH, exist_ok=True)
 os.makedirs(DITHERED_PHOTOS_PATH, exist_ok=True)
 
 app = FastAPI(title="Reframe Dashboard", description="Control & Gallery Interface for Reframe Camera")
+
+
+def prepare_dithered_export(image_path: str, upscale_2x: bool) -> tuple[bytes, str, str]:
+    """Read a dithered image, optionally returning a lossless 2x PNG export."""
+    source_path = Path(image_path)
+    if not upscale_2x:
+        return source_path.read_bytes(), source_path.name, "image/png"
+
+    with Image.open(source_path) as image:
+        resampling = getattr(Image, "Resampling", Image)
+        enlarged = image.resize(
+            (image.width * 2, image.height * 2),
+            resampling.NEAREST
+        )
+        output = BytesIO()
+        enlarged.save(output, format="PNG")
+
+    return output.getvalue(), f"{source_path.stem}.png", "image/png"
 
 
 class SettingsValidationError(ValueError):
@@ -104,6 +124,9 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     boolean(system.get("show_dashboard_qr_on_wifi_connect"), "system.show_dashboard_qr_on_wifi_connect")
     text(system.get("camera_name", ""), "system.camera_name", 80)
 
+    exports = section(settings, "exports", "exports")
+    boolean(exports.get("upscale_dithered_2x"), "exports.upscale_dithered_2x")
+
     extensions = section(settings, "extensions", "extensions")
     arena = section(extensions, "arena", "extensions.arena")
     boolean(arena.get("enabled"), "extensions.arena.enabled")
@@ -140,6 +163,9 @@ class SettingsManager:
                 "auto_timeout_enabled": True,
                 "show_dashboard_qr_on_wifi_connect": True,
                 "camera_name": ""
+            },
+            "exports": {
+                "upscale_dithered_2x": False
             },
             "extensions": {
                 "arena": {
@@ -588,7 +614,16 @@ class ArenaExtension(DashboardExtension):
         if not os.path.exists(dithered_path):
             raise HTTPException(status_code=404, detail="Dithered photo file was not found")
 
-        filename = os.path.basename(dithered_path)
+        upscale_2x = bool(settings.get("exports", {}).get("upscale_dithered_2x", False))
+        try:
+            upload_content, filename, upload_content_type = await asyncio.to_thread(
+                prepare_dithered_export,
+                dithered_path,
+                upscale_2x
+            )
+        except OSError as error:
+            raise HTTPException(status_code=500, detail=f"Could not prepare dithered upload: {error}") from error
+
         headers = {
             "Authorization": f"Bearer {access_token}",
             "User-Agent": self.user_agent
@@ -602,7 +637,7 @@ class ArenaExtension(DashboardExtension):
                     "post",
                     f"{self.api_base}/v3/uploads/presign",
                     headers=headers,
-                    json={"files": [{"filename": filename, "content_type": "image/png"}]}
+                    json={"files": [{"filename": filename, "content_type": upload_content_type}]}
                 )
                 self._raise_for_arena_error(presign_resp, "Could not create Are.na upload URL")
                 presign_data = presign_resp.json()
@@ -612,16 +647,15 @@ class ArenaExtension(DashboardExtension):
 
                 upload_url = presigned_file.get("upload_url")
                 key = presigned_file.get("key")
-                content_type = presigned_file.get("content_type", "image/png")
+                content_type = presigned_file.get("content_type", upload_content_type)
                 if not upload_url or not key:
                     raise HTTPException(status_code=502, detail="Are.na upload URL response was incomplete")
 
-                with open(dithered_path, "rb") as f:
-                    upload_resp = await client.put(
-                        upload_url,
-                        content=f.read(),
-                        headers={"Content-Type": content_type}
-                    )
+                upload_resp = await client.put(
+                    upload_url,
+                    content=upload_content,
+                    headers={"Content-Type": content_type}
+                )
                 if upload_resp.status_code >= 400:
                     raise HTTPException(status_code=502, detail="Upload to Are.na storage failed")
 
@@ -803,6 +837,7 @@ async def dashboard():
             :root {
                 --primary-color: #F5F1F0;  /* background */
                 --secondary-color: #181818;             /* text and borders */
+                --panel-border-color: #242424;           /* dotted panel outlines */
                 --tertiary-color: #F5F1F0;              /* content backgrounds */
                 --hover-color: #333;                  /* hover state color */
             }
@@ -967,7 +1002,7 @@ async def dashboard():
             }
             
             .photo-card {
-                border: 2px solid var(--secondary-color);
+                border: 1.5px dotted var(--panel-border-color);
                 overflow: hidden;
                 background: var(--tertiary-color);
                 position: relative;
@@ -1103,7 +1138,7 @@ async def dashboard():
                 background-color: var(--tertiary-color);
                 margin: 3vh auto;
                 padding: 32px;
-                border: 2px solid var(--secondary-color);
+                border: none;
                 width: min(94vw, 1200px);
                 height: 94vh;
                 box-sizing: border-box;
@@ -1156,13 +1191,14 @@ async def dashboard():
                     "camera processing"
                     "system processing"
                     "system extensions"
+                    "exports extensions"
                     "updates extensions";
                 gap: 20px;
                 align-items: stretch;
             }
             
             .settings-section {
-                border: 1px solid var(--secondary-color);
+                border: 1.5px dotted var(--panel-border-color);
                 padding: 20px;
             }
 
@@ -1180,6 +1216,10 @@ async def dashboard():
 
             .settings-updates {
                 grid-area: updates;
+            }
+
+            .settings-exports {
+                grid-area: exports;
             }
 
             .settings-extensions {
@@ -1384,6 +1424,7 @@ async def dashboard():
                         "camera"
                         "processing"
                         "system"
+                        "exports"
                         "updates"
                         "extensions";
                 }
@@ -1623,6 +1664,20 @@ async def dashboard():
 
                 </div>
 
+                <div class="settings-section settings-exports">
+                    <h3>advanced exports</h3>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">2× dithered downloads and uploads</span>
+                            <select id="upscale-dithered-2x" class="setting-input">
+                                <option value="false">disabled</option>
+                                <option value="true">enabled</option>
+                            </select>
+                        </div>
+                        <div class="setting-help">Doubles dithered PNG dimensions with nearest-neighbor scaling only when downloading one photo or uploading it to Are.na. This tends to help the dithered photos look sharp on social media. Stored photos and ZIP downloads are unchanged.</div>
+                    </div>
+                </div>
+
                 <div class="settings-section settings-updates">
                     <h3>software updates</h3>
                     <div class="setting-group">
@@ -1792,7 +1847,7 @@ async def dashboard():
                                     original
                                 </a>
                                 ${photo.has_dithered ? `
-                                    <a href="${photo.dithered_path}" class="action-btn btn-secondary" download onclick="event.stopPropagation()">
+                                    <a href="/api/download/dithered/${encodeURIComponent(photo.dithered_path.split('/').pop())}" class="action-btn btn-secondary" download onclick="event.stopPropagation()">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 48 48" style="margin-right: 5px;">
                                             <path fill="currentColor" d="M10 28h4v4h-4v-4Zm4 4h4v4h-4v-4Z"/>
                                             <path fill="currentColor" d="M14 32h4v4h-4v-4Zm4 4h4v4h-4v-4Zm20-8h-4v4h4v-4Zm-4 4h-4v4h4v-4Zm-4 4h-4v4h4v-4Zm-8 4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4v-4Zm0-4h4v4h-4V8Zm0-4h4v4h-4V4Z"/>
@@ -2235,6 +2290,8 @@ async def dashboard():
                 document.getElementById('auto-timeout-enabled').value = settings.system.auto_timeout_enabled ? 'true' : 'false';
                 document.getElementById('auto-timeout-minutes').value = settings.system.auto_timeout_minutes || 10;
                 document.getElementById('show-dashboard-qr-on-wifi-connect').value = settings.system.show_dashboard_qr_on_wifi_connect !== false ? 'true' : 'false';
+                const exportSettings = settings.exports || {};
+                document.getElementById('upscale-dithered-2x').value = exportSettings.upscale_dithered_2x ? 'true' : 'false';
                 document.getElementById('update-status').textContent = 'Updates code, dependencies, and service files while preserving settings and photos.';
                 document.getElementById('update-install-btn').style.display = 'none';
 
@@ -2361,6 +2418,9 @@ async def dashboard():
                             auto_timeout_minutes: parseInt(document.getElementById('auto-timeout-minutes').value),
                             show_dashboard_qr_on_wifi_connect: document.getElementById('show-dashboard-qr-on-wifi-connect').value === 'true'
                         },
+                        exports: {
+                            upscale_dithered_2x: document.getElementById('upscale-dithered-2x').value === 'true'
+                        },
                         extensions: {
                             arena: {
                                 enabled: document.getElementById('arena-enabled').value === 'true',
@@ -2420,6 +2480,9 @@ async def dashboard():
                                 auto_timeout_enabled: true,
                                 auto_timeout_minutes: 10,
                                 show_dashboard_qr_on_wifi_connect: true
+                            },
+                            exports: {
+                                upscale_dithered_2x: false
                             },
                             extensions: {
                                 arena: {
@@ -3064,6 +3127,37 @@ async def serve_dithered_photo(filename: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Dithered photo not found")
     return FileResponse(file_path)
+
+
+@app.get("/api/download/dithered/{filename}")
+async def download_dithered_photo(filename: str):
+    """Download one dithered photo with optional on-demand 2x scaling."""
+    if filename != os.path.basename(filename):
+        raise HTTPException(status_code=400, detail="Invalid photo filename")
+
+    file_path = os.path.join(DITHERED_PHOTOS_PATH, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Dithered photo not found")
+
+    settings = settings_manager.load_settings()
+    upscale_2x = bool(settings.get("exports", {}).get("upscale_dithered_2x", False))
+    if not upscale_2x:
+        return FileResponse(file_path, filename=filename)
+
+    try:
+        content, export_filename, media_type = await asyncio.to_thread(
+            prepare_dithered_export,
+            file_path,
+            True
+        )
+    except OSError as error:
+        raise HTTPException(status_code=500, detail=f"Could not prepare dithered download: {error}") from error
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{export_filename}"'}
+    )
 
 @app.get("/api/settings")
 async def get_settings():

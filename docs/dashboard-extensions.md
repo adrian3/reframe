@@ -82,6 +82,8 @@ When the extension is fully configured, an `are.na` button appears next to photo
 
 Only the dithered PNG is uploaded. Original JPEGs are not uploaded by this extension.
 
+If the advanced 2× dithered export setting is enabled, the dashboard enlarges the PNG with nearest-neighbor scaling immediately before upload. It does not crop or modify the stored dithered photo. The setting is disabled by default.
+
 The created Are.na block uses:
 
 - title: `reFrame {photo_id}`
