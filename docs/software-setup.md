@@ -6,7 +6,8 @@ How to set up a reFrame camera from scratch.
 
 Download and install [Raspberry Pi Imager](https://www.raspberrypi.com/software/). Insert a microSD card into your computer and flash it with the following settings:
 
-- **OS:** Raspberry Pi OS Lite (32-bit)
+- **Device**: Raspberry Pi Zero 2 W
+- **OS:** Raspberry Pi OS (other) > Raspberry Pi OS Lite (64-bit)
 - **Hostname:** `reframe`
 - **Username:** `cam`
 - **Password:** your choice (but write it down somewhere safe)
@@ -17,12 +18,6 @@ Eject the card, insert it into the Pi Zero 2 W, and power it on. On a new
 PiSugar 3, the first power-on may require a short press followed by a long
 press. The reFrame installer disables this accidental-touch prevention mode so
 later power-ons use a single press.
-
-### Raspberry Pi OS Version
-
-The reference build currently uses Raspberry Pi OS Lite 32-bit. Bullseye is the most tested target for this repo because it was the first Raspberry Pi OS release with the libcamera/Picamera2 stack that Camera Module 3 depends on, and early Zero 2 W camera support had some version-specific rough edges.
-
-Bookworm should be possible now: current Raspberry Pi Picamera2 documentation supports Bullseye or later, and Bookworm uses the same modern libcamera/Picamera2 direction.
 
 ## 2. SSH into the Pi
 
@@ -37,13 +32,13 @@ Enter the password you set in the imager.
 ## 3. Install reFrame
 
 ```bash
+sudo apt update
+sudo apt install -y git
 git clone https://github.com/kaloyaan/reframe.git
 cd reframe
 chmod +x install.sh
 ./install.sh
 ```
-
-The script installs all system and Python dependencies, enables I2C/SPI/camera interfaces, installs PiSugar Power Manager if it is missing, configures PiSugar one-press power-on, applies the headless boot-speed settings, sets up the systemd services, and creates the photo directories. It will prompt you to reboot when done.
 
 If the official PiSugar installer asks you to select a model, choose **PiSugar 3**. After installation:
 
@@ -84,6 +79,33 @@ sudo reboot
 ```
 
 After rebooting, reFrame starts automatically. The camera takes a photo on startup, sends it to the ePaper screen, then saves the original JPEG and dithered PNG in the background.
+
+### Troubleshooting / Verifying the Installation
+
+If something is not working, SSH back into the camera after it finishes booting, then check that all three services are active:
+
+```bash
+sudo systemctl is-active \
+    reframe.service \
+    reframe-dashboard.service \
+    reframe-dashboard-proxy.service
+```
+
+Each line should say `active`. Confirm that the services select the managed
+Python environment:
+
+```bash
+/home/cam/reframe/scripts/reframe-python -c \
+    'import sys; print(sys.executable)'
+```
+
+The result should be `/home/cam/reframe/.venv/bin/python`. Finally, test both
+dashboard paths from the camera itself:
+
+```bash
+wget -q --spider http://127.0.0.1:8000/ && echo "dashboard backend OK"
+wget -q --spider http://127.0.0.1/ && echo "dashboard proxy OK"
+```
 
 ---
 
@@ -168,6 +190,10 @@ sudo systemctl status reframe.service      # check status
 sudo journalctl -u reframe.service -f      # view logs
 sudo systemctl restart reframe.service     # restart
 sudo systemctl stop reframe.service        # stop
+
+sudo systemctl status reframe-dashboard.service       # dashboard backend
+sudo journalctl -u reframe-dashboard.service -f       # dashboard logs
+sudo systemctl restart reframe-dashboard.service      # restart dashboard
 ```
 
 ---
@@ -180,7 +206,7 @@ If you prefer to set things up by hand, here's what the install script does:
 
 ```bash
 sudo apt update
-sudo apt install -y python3-pip python3-picamera2 python3-spidev \
+sudo apt install -y git python3-pip python3-venv python3-picamera2 python3-spidev \
     python3-gpiozero v4l-utils i2c-tools netcat-openbsd wget
 ```
 
@@ -197,8 +223,17 @@ Select **PiSugar 3** if prompted by the PiSugar installer.
 ### Python Packages
 
 ```bash
-pip3 install -r requirements.txt
+python3 -m venv --system-site-packages .venv
+PYTHONNOUSERSITE=1 .venv/bin/python -m pip install -r requirements.txt
 ```
+
+`--system-site-packages` makes the Raspberry Pi OS Picamera2/libcamera packages
+available inside the project environment. `PYTHONNOUSERSITE=1` keeps the
+environment reproducible if setup is rerun or the camera is upgraded by
+preventing unrelated packages in `~/.local` from taking precedence. A fresh
+installation does not need any special cleanup. Do not delete the operating
+system's `EXTERNALLY-MANAGED` marker or globally enable
+`--break-system-packages`.
 
 ### Enable Hardware Interfaces
 
@@ -207,9 +242,7 @@ sudo raspi-config nonint do_i2c 0
 sudo raspi-config nonint do_spi 0
 ```
 
-The camera should be auto-detected. If not, add `camera_auto_detect=1` to your boot config:
-- **Bullseye:** `/boot/config.txt`
-- **Bookworm:** `/boot/firmware/config.txt`
+The camera should be auto-detected. If not, add `camera_auto_detect=1` to your boot config.
 
 ### User Permissions
 
@@ -233,6 +266,7 @@ sudo cp systemd/reframe-dashboard.service /etc/systemd/system/
 sudo cp systemd/reframe-dashboard-proxy.service /etc/systemd/system/
 sudo cp systemd/reframe-rtc-restore.service /etc/systemd/system/
 sudo cp systemd/reframe-rtc-update.service /etc/systemd/system/
+chmod +x scripts/enable_hdr.sh scripts/reframe-python
 sudo install -o root -g root -m 0755 scripts/reframe-rtc-sync /usr/local/sbin/reframe-rtc-sync
 sudo install -d -o root -g root -m 0755 /var/lib/reframe
 sudo timedatectl set-timezone UTC
@@ -249,7 +283,7 @@ The camera service selects the `ondemand` CPU governor when the host supports it
 
 The installer optimizes for fastest boot-to-first-photo while keeping WiFi, SSH, mDNS, PiSugar, and camera capture working.
 
-It writes these headless hardware settings to the Pi boot config (`/boot/config.txt` on Bullseye, `/boot/firmware/config.txt` on Bookworm):
+It writes these headless hardware settings to the Pi boot config.
 
 ```bash
 dtoverlay=disable-bt
@@ -305,7 +339,6 @@ sudo systemctl enable --now bluetooth.service hciuart.service
 
 **Camera not detected**
 - Verify the ribbon cable is seated properly on both ends
-- Check: `libcamera-hello --list-cameras`
 - Ensure `cam` is in the `video` group: `groups cam`
 
 **Display not updating**
@@ -321,3 +354,10 @@ sudo systemctl enable --now bluetooth.service hciuart.service
 - The service files expect the repo at `/home/cam/reframe`
 - Check: `sudo systemctl status reframe.service`
 - View full logs: `sudo journalctl -u reframe.service --no-pager`
+
+**Dashboard says it is starting or unavailable**
+- Check the backend directly: `wget -S -O /dev/null http://127.0.0.1:8000/`
+- Check its status: `sudo systemctl status reframe-dashboard.service --no-pager -l`
+- View this boot's logs: `sudo journalctl -u reframe-dashboard.service -b --no-pager -n 100`
+- Confirm the service interpreter exists: `test -x /home/cam/reframe/.venv/bin/python && echo OK`
+- Re-run `./install.sh` if the virtual environment or dependencies are missing

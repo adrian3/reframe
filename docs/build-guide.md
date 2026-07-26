@@ -81,14 +81,15 @@ Before starting assembly, make sure you have printed all the necessary enclosure
 
 1. Insert the microSD card into your computer.
 2. Open Raspberry Pi Imager.
-3. Select **Raspberry Pi OS (64-bit)**.
-4. Click the gear icon to edit settings:
-   - **Hostname:** `reframe`
-   - **Username:** `cam`
-   - **Password:** choose something simple
-   - **WiFi:** enter your network SSID and password
-   - **Enable SSH** with password authentication
-5. Write the image and eject the card.
+3. Select the settings:
+   - **Device**: Raspberry Pi Zero 2 W
+   - **OS**: Raspberry Pi OS (other) > Raspberry Pi OS Lite (64-bit)
+   - **Hostname**: `reframe`
+   - **Username**: `cam`
+   - **Password**: your choice (but write it down somewhere safe)
+   - **WiFi**: enter your home network name and password. If you want to use the camera on the go, also add your phone's hotspot (you can add multiple networks)
+   - **Services**: Enable SSH with password authentication
+4. Write the image and eject the card.
 
 The username `cam` is required by the current service and updater configuration.
 

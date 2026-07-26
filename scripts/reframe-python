@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# Use reFrame's managed environment. The system-Python fallback keeps cameras
+# bootable during the one-time update from releases that predate .venv.
+VENV_PYTHON="/home/cam/reframe/.venv/bin/python"
+
+if [ -x "$VENV_PYTHON" ]; then
+    export PYTHONNOUSERSITE=1
+    exec "$VENV_PYTHON" "$@"
+fi
+
+echo "reFrame virtual environment is missing; using /usr/bin/python3 fallback" >&2
+echo "Run /home/cam/reframe/install.sh to create the managed environment" >&2
+exec /usr/bin/python3 "$@"

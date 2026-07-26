@@ -14,7 +14,7 @@ WorkingDirectory=/home/cam/reframe
 # Use maximum clock only for boot-critical imports/capture, then return to a
 # demand-based governor after READY=1 or whenever the service stops.
 ExecStartPre=+/bin/sh -c 'if grep -qw performance /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; fi; exit 0'
-ExecStart=/usr/bin/python3 /home/cam/reframe/reframe.py
+ExecStart=/home/cam/reframe/scripts/reframe-python /home/cam/reframe/reframe.py
 ExecStartPost=+/bin/sh -c 'if grep -qw ondemand /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo ondemand > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; elif grep -qw schedutil /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo schedutil > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; fi; exit 0'
 ExecStopPost=+/bin/sh -c 'if grep -qw ondemand /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo ondemand > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; elif grep -qw schedutil /sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors 2>/dev/null; then echo schedutil > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; fi; exit 0'
 Restart=always

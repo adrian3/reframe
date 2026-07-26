@@ -24,6 +24,7 @@ BOOT_CMDLINE="/boot/cmdline.txt"
 REQUIRED_USER="cam"
 REQUIRED_REPO="/home/cam/reframe"
 CURRENT_USER="$(id -un)"
+VENV_DIR="$SCRIPT_DIR/.venv"
 
 if [ "$(id -u)" -eq 0 ]; then
     error "Do not run install.sh with sudo or as root."
@@ -56,7 +57,9 @@ step "Installing system packages"
 
 sudo apt update -qq
 sudo apt install -y -qq \
+    git \
     python3-pip \
+    python3-venv \
     python3-picamera2 \
     python3-spidev \
     python3-gpiozero \
@@ -75,9 +78,10 @@ info "I2C enabled"
 # ── 2. Python packages ──────────────────────
 step "Installing Python packages"
 
-pip3 install -r "$SCRIPT_DIR/requirements.txt"
+/usr/bin/python3 -m venv --system-site-packages "$VENV_DIR"
+PYTHONNOUSERSITE=1 "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/requirements.txt"
 
-info "Python packages installed"
+info "Python packages installed in $VENV_DIR"
 
 # ── 3. PiSugar Power Manager ────────────────
 step "Checking for PiSugar Power Manager"
@@ -219,11 +223,12 @@ mkdir -p "$SCRIPT_DIR/photos"
 mkdir -p "$SCRIPT_DIR/dithered_photos"
 info "Photo directories ready"
 
-# ── 8. HDR script ───────────────────────────
-step "Setting up HDR script"
+# ── 8. Runtime scripts ──────────────────────
+step "Setting up runtime scripts"
 
 chmod +x "$SCRIPT_DIR/scripts/enable_hdr.sh"
-info "enable_hdr.sh marked executable"
+chmod +x "$SCRIPT_DIR/scripts/reframe-python"
+info "Runtime scripts marked executable"
 
 # Install the narrow privileged helper used after dashboard git updates.
 sudo install -o root -g root -m 0755 "$SCRIPT_DIR/scripts/reframe-apply-update" /usr/local/sbin/reframe-apply-update

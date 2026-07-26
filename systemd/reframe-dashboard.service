@@ -3,14 +3,14 @@ Description=Reframe Dashboard Service
 # reframe.service uses Type=notify, so this begins after startup capture dispatch.
 After=reframe.service network.target
 Wants=network.target
-Requires=reframe.service
+Wants=reframe.service
 
 [Service]
 Type=simple
 User=cam
 Group=cam
 WorkingDirectory=/home/cam/reframe
-ExecStart=/usr/bin/python3 /home/cam/reframe/dashboard.py
+ExecStart=/home/cam/reframe/scripts/reframe-python /home/cam/reframe/dashboard.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

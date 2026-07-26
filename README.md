@@ -42,9 +42,11 @@ See the full [bill of materials](docs/build-guide.md#materials).
 
 **→ [Dashboard Extensions](docs/dashboard-extensions.md)** — Upload your photos directly from the camera to Are.na + more.
 
-Once you have the hardware assembled and Raspberry Pi OS flashed, setup is one command:
+Once you have the hardware assembled and Raspberry Pi OS flashed, run:
 
 ```bash
+sudo apt update
+sudo apt install -y git
 git clone https://github.com/kaloyaan/reframe.git
 cd reframe
 chmod +x install.sh

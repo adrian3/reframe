@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_PATH="/home/cam/reframe"
 CAM_HOME="/home/cam"
+VENV_PATH="$REPO_PATH/.venv"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "reframe-apply-update must run as root" >&2
@@ -13,6 +14,7 @@ required_files=(
     requirements.txt
     scripts/enable_hdr.sh
     scripts/reframe-apply-update
+    scripts/reframe-python
     scripts/reframe-rtc-sync
     systemd/reframe.service
     systemd/reframe-dashboard.service
@@ -28,12 +30,13 @@ for required in "${required_files[@]}"; do
     fi
 done
 
-pip_flags=(--user)
-if runuser -u cam -- env HOME="$CAM_HOME" /usr/bin/python3 -m pip install --help 2>/dev/null | grep -- "--break-system-packages" >/dev/null; then
-    pip_flags+=(--break-system-packages)
+if ! dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q "install ok installed"; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv
 fi
 
-runuser -u cam -- env HOME="$CAM_HOME" /usr/bin/python3 -m pip install "${pip_flags[@]}" -r "$REPO_PATH/requirements.txt"
+runuser -u cam -- env HOME="$CAM_HOME" /usr/bin/python3 -m venv --system-site-packages "$VENV_PATH"
+runuser -u cam -- env HOME="$CAM_HOME" PYTHONNOUSERSITE=1 "$VENV_PATH/bin/python" -m pip install -r "$REPO_PATH/requirements.txt"
 
 install -o root -g root -m 0755 "$REPO_PATH/scripts/reframe-apply-update" /usr/local/sbin/reframe-apply-update
 install -o root -g root -m 0755 "$REPO_PATH/scripts/reframe-rtc-sync" /usr/local/sbin/reframe-rtc-sync
@@ -44,6 +47,7 @@ install -o root -g root -m 0644 "$REPO_PATH/systemd/reframe-rtc-restore.service"
 install -o root -g root -m 0644 "$REPO_PATH/systemd/reframe-rtc-update.service" /etc/systemd/system/reframe-rtc-update.service
 install -d -o root -g root -m 0755 /var/lib/reframe
 chmod 0755 "$REPO_PATH/scripts/enable_hdr.sh"
+chmod 0755 "$REPO_PATH/scripts/reframe-python"
 timedatectl set-timezone UTC
 timedatectl set-ntp true
 

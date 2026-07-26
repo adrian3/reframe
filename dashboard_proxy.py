@@ -9,13 +9,36 @@ http://hostname.local URL.
 
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import errno
 import os
+import time
 
 
 TARGET_HOST = os.environ.get("REFRAME_DASHBOARD_HOST", "127.0.0.1")
 TARGET_PORT = int(os.environ.get("REFRAME_DASHBOARD_PORT", "8000"))
 LISTEN_HOST = os.environ.get("REFRAME_PROXY_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("REFRAME_PROXY_PORT", "80"))
+BACKEND_CONNECT_ATTEMPTS = int(os.environ.get("REFRAME_PROXY_CONNECT_ATTEMPTS", "20"))
+BACKEND_CONNECT_DELAY = float(os.environ.get("REFRAME_PROXY_CONNECT_DELAY", "0.25"))
+
+
+def request_backend(method, path, body, headers):
+    """Send one request, briefly retrying while the dashboard starts."""
+    attempts = max(BACKEND_CONNECT_ATTEMPTS, 1)
+
+    for attempt in range(attempts):
+        conn = HTTPConnection(TARGET_HOST, TARGET_PORT, timeout=30)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            return conn, conn.getresponse()
+        except OSError as exc:
+            conn.close()
+            is_refused = exc.errno == errno.ECONNREFUSED
+            if not is_refused or attempt == attempts - 1:
+                raise
+            time.sleep(max(BACKEND_CONNECT_DELAY, 0))
+
+    raise RuntimeError("Dashboard backend retry loop exited unexpectedly")
 
 
 class DashboardProxyHandler(BaseHTTPRequestHandler):
@@ -52,9 +75,12 @@ class DashboardProxyHandler(BaseHTTPRequestHandler):
 
         conn = None
         try:
-            conn = HTTPConnection(TARGET_HOST, TARGET_PORT, timeout=30)
-            conn.request(method_override or self.command, self.path, body=body, headers=headers)
-            response = conn.getresponse()
+            conn, response = request_backend(
+                method_override or self.command,
+                self.path,
+                body,
+                headers,
+            )
             response_body = response.read()
 
             self.send_response(response.status, response.reason)
@@ -67,12 +93,26 @@ class DashboardProxyHandler(BaseHTTPRequestHandler):
             if send_body:
                 self.wfile.write(response_body)
         except Exception as e:
-            message = f"Dashboard proxy error: {e}".encode("utf-8")
-            self.send_response(502)
+            unavailable = isinstance(e, OSError) and e.errno == errno.ECONNREFUSED
+            if unavailable:
+                message = (
+                    "reFrame dashboard is starting or unavailable.\n"
+                    "Try again shortly. If this persists, run:\n"
+                    "sudo systemctl status reframe-dashboard.service\n"
+                ).encode("utf-8")
+                status = 503
+            else:
+                message = f"Dashboard proxy error: {e}".encode("utf-8")
+                status = 502
+
+            self.send_response(status)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(message)))
+            if unavailable:
+                self.send_header("Retry-After", "2")
             self.end_headers()
-            self.wfile.write(message)
+            if send_body:
+                self.wfile.write(message)
         finally:
             try:
                 conn.close()
