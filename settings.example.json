@@ -1,8 +1,8 @@
 {
   "camera": {
     "resolution": {
-      "width": 1200,
-      "height": 800
+      "width": 3280,
+      "height": 2464
     },
     "exposure_value": 0,
     "sharpness": 3,
@@ -24,6 +24,9 @@
     "auto_refresh_interval": 30,
     "auto_timeout_minutes": 10,
     "auto_timeout_enabled": true,
+    "shutdown_warning_seconds": 60,
+    "shutdown_buzzer_enabled": true,
+    "shutdown_buzzer_pin": 23,
     "show_dashboard_qr_on_wifi_connect": true,
     "camera_name": ""
   },

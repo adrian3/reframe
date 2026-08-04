@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+CONNECTION_NAME="${1:-iphone-hotspot}"
+IFACE="${REFRAME_WIFI_IFACE:-wlan0}"
+TRIES="${REFRAME_WIFI_TRIES:-6}"
+DELAY_SECONDS="${REFRAME_WIFI_DELAY_SECONDS:-5}"
+
+SSID="$(nmcli -g 802-11-wireless.ssid connection show "$CONNECTION_NAME" 2>/dev/null || true)"
+if [ -z "$SSID" ]; then
+    echo "WiFi preference skipped: NetworkManager connection '$CONNECTION_NAME' is not configured"
+    exit 0
+fi
+
+i=1
+while [ "$i" -le "$TRIES" ]; do
+    nmcli dev wifi rescan ifname "$IFACE" >/dev/null 2>&1 || true
+    sleep 2
+
+    if nmcli -g SSID dev wifi list ifname "$IFACE" 2>/dev/null | grep -Fxq "$SSID"; then
+        current="$(nmcli -g GENERAL.CONNECTION dev show "$IFACE" 2>/dev/null || true)"
+        if [ "$current" = "$CONNECTION_NAME" ]; then
+            echo "Already connected to preferred WiFi '$SSID'"
+            exit 0
+        fi
+        echo "Preferred WiFi '$SSID' is visible; switching from '${current:-none}'"
+        nmcli connection up "$CONNECTION_NAME" ifname "$IFACE"
+        exit 0
+    fi
+
+    i=$((i + 1))
+    sleep "$DELAY_SECONDS"
+done
+
+echo "Preferred WiFi '$SSID' was not visible; leaving current WiFi connection unchanged"

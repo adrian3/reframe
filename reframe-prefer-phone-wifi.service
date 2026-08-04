@@ -1,0 +1,13 @@
+[Unit]
+Description=Prefer iPhone hotspot WiFi when visible
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=REFRAME_WIFI_TRIES=18
+Environment=REFRAME_WIFI_DELAY_SECONDS=10
+ExecStart=/usr/local/bin/reframe-prefer-phone-wifi iphone-hotspot
+
+[Install]
+WantedBy=multi-user.target

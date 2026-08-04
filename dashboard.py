@@ -121,6 +121,9 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     integer(system.get("auto_refresh_interval"), "system.auto_refresh_interval", 5, 300)
     integer(system.get("auto_timeout_minutes"), "system.auto_timeout_minutes", 1, 60)
     boolean(system.get("auto_timeout_enabled"), "system.auto_timeout_enabled")
+    integer(system.get("shutdown_warning_seconds", 60), "system.shutdown_warning_seconds", 0, 600)
+    boolean(system.get("shutdown_buzzer_enabled", True), "system.shutdown_buzzer_enabled")
+    integer(system.get("shutdown_buzzer_pin", 23), "system.shutdown_buzzer_pin", 0, 27)
     boolean(system.get("show_dashboard_qr_on_wifi_connect"), "system.show_dashboard_qr_on_wifi_connect")
     text(system.get("camera_name", ""), "system.camera_name", 80)
 
@@ -140,7 +143,7 @@ class SettingsManager:
         self.settings_path = Path(settings_path)
         self.default_settings = {
             "camera": {
-                "resolution": {"width": 1200, "height": 800},
+                "resolution": {"width": 3280, "height": 2464},
                 "exposure_value": 0,
                 "sharpness": 3,
                 "autofocus_mode": 2
@@ -161,6 +164,9 @@ class SettingsManager:
                 "auto_refresh_interval": 30,
                 "auto_timeout_minutes": 10,
                 "auto_timeout_enabled": True,
+                "shutdown_warning_seconds": 60,
+                "shutdown_buzzer_enabled": True,
+                "shutdown_buzzer_pin": 23,
                 "show_dashboard_qr_on_wifi_connect": True,
                 "camera_name": ""
             },
@@ -832,7 +838,7 @@ async def dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-        <title>Reframe</title>
+        <title>Ade’s e-Ink Camera</title>
         <style>
             :root {
                 --primary-color: #F5F1F0;  /* background */
@@ -1087,6 +1093,11 @@ async def dashboard():
             .btn-success {
                 background: rgba(255, 255, 255, 0.9);
                 color: var(--secondary-color);
+            }
+
+            .btn-danger {
+                background: rgba(211, 47, 47, 0.92);
+                color: var(--tertiary-color);
             }
             
             .action-btn:hover {
@@ -1475,7 +1486,7 @@ async def dashboard():
         <div class="container">
             <div class="header">
                 <div class="status-bar">
-                <h1>reframe.camera dashboard</h1>
+                <h1>Ade’s e-Ink Camera</h1>
                 <div class="status-item">
                     <div class="status-indicator"></div>
                     <span>system online</span>
@@ -1861,6 +1872,12 @@ async def dashboard():
                                     </svg>
                                     display
                                 </button>
+                                <button class="action-btn btn-danger" onclick="event.stopPropagation(); deletePhoto('${photo.id}', this)">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 48 48" style="margin-right: 5px;">
+                                        <path fill="currentColor" d="M16 6h16l2 4h8v4H6v-4h8l2-4Zm-4 12h24l-2 24H14l-2-24Zm8 4v16h4V22h-4Zm8 0v16h4V22h-4Z"/>
+                                    </svg>
+                                    delete
+                                </button>
                                 ${renderExtensionButtons(photo)}
                             </div>
                         </div>
@@ -2093,6 +2110,51 @@ async def dashboard():
                 } catch (error) {
                     console.error('Error displaying photo:', error);
                     alert('Error displaying photo');
+                }
+            }
+
+            async function deletePhoto(photoId, button) {
+                const photo = photos.find(p => p.id === photoId);
+                const label = photo ? `photo ${photo.id}` : 'this photo';
+                const confirmed = confirm(`Delete ${label}? This will permanently remove the original and dithered files.`);
+                if (!confirmed) {
+                    return;
+                }
+
+                const originalContent = button ? button.innerHTML : '';
+
+                try {
+                    notifyUserActivity(); // Track delete interaction
+                    if (button) {
+                        button.textContent = 'deleting...';
+                        button.disabled = true;
+                        button.style.opacity = '0.7';
+                    }
+
+                    const response = await fetch(`/api/photos/${encodeURIComponent(photoId)}`, {
+                        method: 'DELETE'
+                    });
+
+                    if (!response.ok) {
+                        let message = 'Failed to delete photo';
+                        try {
+                            const error = await response.json();
+                            message = error.detail || message;
+                        } catch (_) {
+                            message = await response.text() || message;
+                        }
+                        throw new Error(message);
+                    }
+
+                    await loadPhotos(currentPage);
+                } catch (error) {
+                    console.error('Error deleting photo:', error);
+                    alert(`Error: ${error.message}`);
+                    if (button) {
+                        button.innerHTML = originalContent;
+                        button.disabled = false;
+                        button.style.opacity = '1';
+                    }
                 }
             }
 
@@ -2461,7 +2523,7 @@ async def dashboard():
                     try {
                         const defaultSettings = {
                             camera: {
-                                resolution: {width: 1200, height: 800},
+                                resolution: {width: 3280, height: 2464},
                                 exposure_value: 0,
                                 sharpness: 3,
                                 autofocus_mode: 2
@@ -2479,6 +2541,9 @@ async def dashboard():
                                 auto_refresh_interval: 30,
                                 auto_timeout_enabled: true,
                                 auto_timeout_minutes: 10,
+                                shutdown_warning_seconds: 60,
+                                shutdown_buzzer_enabled: true,
+                                shutdown_buzzer_pin: 23,
                                 show_dashboard_qr_on_wifi_connect: true
                             },
                             exports: {
@@ -3111,6 +3176,14 @@ async def get_photo_info(photo_id: str):
         return photo
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+@app.delete("/api/photos/{photo_id}")
+async def delete_photo(photo_id: str):
+    """Delete a specific photo through the hardware service."""
+    try:
+        return await reframe_client.delete(f"/photos/{photo_id}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete photo: {str(e)}")
 
 @app.get("/photos/{filename}")
 async def serve_original_photo(filename: str):

@@ -161,8 +161,9 @@ HDR + autofocus make a big difference on the ePaper display.
 
 reFrame captures the startup/button photo into memory first so the image can be dithered and sent to the ePaper display quickly. It then saves files in the background:
 
-- Original camera captures are saved as JPEGs for faster capture and smaller files.
-- The display/dashboard dithered version is saved as a PNG so the 6-color dithered image stays crisp.
+- Original camera captures are saved as JPEGs at the configured camera resolution. For the local Camera Module V2 build, the default is the full `3280×2464` still frame.
+- The display/dashboard dithered version is saved as a `600×400` PNG so the 6-color dithered image stays crisp.
+- To make the `3280×2464` camera frame fit the display without distortion, reFrame keeps the full `2464px` source height, center-crops width to about `1643px`, resizes that portrait crop to `400×600`, then rotates it `-90°` to the final `600×400` dithered image.
 - Immediately after a capture, the dashboard may take a moment to show the newest files while the background save finishes.
 
 By default, reFrame shuts down automatically after 10 minutes without button, dashboard, or display activity to avoid draining the PiSugar battery. You can change this in `settings.json` with `system.auto_timeout_minutes` and `system.auto_timeout_enabled`.
@@ -242,7 +243,17 @@ sudo raspi-config nonint do_i2c 0
 sudo raspi-config nonint do_spi 0
 ```
 
-The camera should be auto-detected. If not, add `camera_auto_detect=1` to your boot config.
+This local build is configured for the Raspberry Pi Camera Module V2 / NoIR V2
+(`imx219`). Use this boot config:
+
+```bash
+camera_auto_detect=0
+dtoverlay=imx219
+```
+
+Boot config paths:
+- **Bullseye:** `/boot/config.txt`
+- **Bookworm:** `/boot/firmware/config.txt`
 
 ### User Permissions
 
@@ -290,7 +301,8 @@ dtoverlay=disable-bt
 dtparam=audio=off
 hdmi_blanking=2
 boot_delay=0
-camera_auto_detect=1
+camera_auto_detect=0
+dtoverlay=imx219
 display_auto_detect=0
 disable_splash=1
 disable_poe_fan=1

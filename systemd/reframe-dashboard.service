@@ -1,7 +1,8 @@
 [Unit]
 Description=Reframe Dashboard Service
-# reframe.service uses Type=notify, so this begins after startup capture dispatch.
-After=reframe.service network.target
+# The dashboard should still come up if the camera service is waiting for
+# hardware or crash-looping.
+After=network.target
 Wants=network.target
 Wants=reframe.service
 

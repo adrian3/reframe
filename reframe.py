@@ -79,6 +79,8 @@ PROCESSED_PATH = os.path.join(BASE_PATH, "dithered_photos")
 RUNTIME_PATH = os.path.join(BASE_PATH, ".runtime")
 HDR_HELPER_PATH = os.path.join(BASE_PATH, "scripts", "enable_hdr.sh")
 ORIGINAL_CAPTURE_EXTENSION = "jpg"
+DEFAULT_CAPTURE_WIDTH = 3280
+DEFAULT_CAPTURE_HEIGHT = 2464
 DISPLAY_IMAGE_WIDTH = 600
 DISPLAY_IMAGE_HEIGHT = 400
 DISPLAY_PANEL_WIDTH = 400
@@ -267,7 +269,7 @@ class CameraManager:
             # Return default settings
             return {
                 "camera": {
-                    "resolution": {"width": 1200, "height": 800},
+                    "resolution": {"width": DEFAULT_CAPTURE_WIDTH, "height": DEFAULT_CAPTURE_HEIGHT},
                     "exposure_value": 0,
                     "sharpness": 3,
                     "autofocus_mode": 2
@@ -385,7 +387,10 @@ class CameraManager:
     def configure_camera(self):
         """Configure the camera settings."""
         camera_settings = self.settings.get("camera", {})
-        resolution = camera_settings.get("resolution", {"width": 1200, "height": 800})
+        resolution = camera_settings.get(
+            "resolution",
+            {"width": DEFAULT_CAPTURE_WIDTH, "height": DEFAULT_CAPTURE_HEIGHT}
+        )
 
         # Safely stop the camera before reconfiguring to avoid runtime errors
         try:
@@ -441,6 +446,18 @@ class CameraManager:
     def get_timeout_minutes(self):
         """Get the timeout duration in minutes from settings."""
         return self.settings.get("system", {}).get("auto_timeout_minutes", 10)
+
+    def get_shutdown_warning_seconds(self):
+        """Get how long before auto-shutdown to warn the user."""
+        return self.settings.get("system", {}).get("shutdown_warning_seconds", 60)
+
+    def is_shutdown_buzzer_enabled(self):
+        """Check if the shutdown warning buzzer is enabled."""
+        return self.settings.get("system", {}).get("shutdown_buzzer_enabled", True)
+
+    def get_shutdown_buzzer_pin(self):
+        """Get the BCM GPIO pin used for the shutdown warning buzzer."""
+        return self.settings.get("system", {}).get("shutdown_buzzer_pin", 23)
 
     def is_timeout_exceeded(self):
         """Check if the timeout period has been exceeded."""
@@ -765,18 +782,39 @@ class ImageProcessor:
 
     @staticmethod
     def resize_image(image, size=DISPLAY_IMAGE_SIZE):
-        """Resizes the image to the specified size."""
-        Image, _ = _lazy_import_pil()
-        if image.size == (size[0] * 2, size[1] * 2) and hasattr(image, "reduce"):
-            # Preserve the 2x source capture and average each 2x2 block before
-            # dithering. This is faster than generic scaling and still provides
-            # a properly filtered high-resolution source.
-            return image.reduce(2)
+        """Make the dither/display image while preserving source height.
 
-        # Pillow >= 10 moved filters under Image.Resampling; older Pi builds keep them on Image.
+        The saved original capture remains untouched. For the Camera Module V2
+        full frame, this keeps all 2464 source pixels of height, crops width to
+        the 2:3 portrait aspect needed for 400x600, resizes, then rotates into
+        the final 600x400 dither/dashboard image.
+        """
+        Image, _ = _lazy_import_pil()
+        src_width, src_height = image.size
+        final_width, final_height = size
+        portrait_size = (final_height, final_width)
+        target_ratio = portrait_size[0] / portrait_size[1]
+        crop_width = min(src_width, int(round(src_height * target_ratio)))
+        crop_height = min(src_height, int(round(crop_width / target_ratio)))
+
+        left = max((src_width - crop_width) // 2, 0)
+        top = max((src_height - crop_height) // 2, 0)
+        cropped = image.crop((left, top, left + crop_width, top + crop_height))
+
+        # Pillow >= 10 moved filters under Image.Resampling; older Pi builds
+        # keep them on Image.
         resampling_attr = getattr(Image, "Resampling", Image)
         resample_filter = getattr(resampling_attr, "BILINEAR", Image.BILINEAR)
-        return image.resize(size, resample_filter)
+        resized = cropped.resize(portrait_size, resample_filter)
+        rotated = resized.rotate(-90, expand=True)
+        logging.info(
+            "resize_image: center-cropped %sx%s to %sx%s, resized to %sx%s, rotated to %sx%s",
+            src_width, src_height,
+            cropped.size[0], cropped.size[1],
+            portrait_size[0], portrait_size[1],
+            rotated.size[0], rotated.size[1]
+        )
+        return rotated
 
     @staticmethod
     def img2buffer(image, width=DISPLAY_PANEL_WIDTH, height=DISPLAY_PANEL_HEIGHT):
@@ -1266,6 +1304,7 @@ class CameraSystem:
         self.dashboard_qr_thread = None
         self._dashboard_qr_monitor_started = False
         self.dashboard_qr_running = False
+        self._buzzer_lock = threading.Lock()
         logging.info("Timeout monitor initialization deferred for fast startup")
 
     def start_timeout_monitor(self):
@@ -1300,16 +1339,43 @@ class CameraSystem:
         if self._timeout_stop_event.wait(60):
             return
 
+        warning_sent_for_activity = None
+
         while self.timeout_running and not self._timeout_stop_event.is_set():
             try:
+                elapsed = self.camera_manager.get_inactivity_seconds()
+                timeout_seconds = self.camera_manager.get_timeout_minutes() * 60
+                warning_seconds = self.camera_manager.get_shutdown_warning_seconds()
+                remaining_seconds = timeout_seconds - elapsed
+                activity_marker = int(elapsed)
+
+                if elapsed < 5:
+                    warning_sent_for_activity = None
+
+                if (
+                    self.camera_manager.is_timeout_enabled()
+                    and self.camera_manager.is_shutdown_buzzer_enabled()
+                    and warning_seconds > 0
+                    and remaining_seconds <= warning_seconds
+                    and remaining_seconds > 0
+                    and warning_sent_for_activity is None
+                ):
+                    logging.info(
+                        "Auto-shutdown warning: %.0f seconds remaining; sounding buzzer",
+                        remaining_seconds
+                    )
+                    self.play_shutdown_warning_buzzer()
+                    warning_sent_for_activity = activity_marker
+
                 if self.camera_manager.is_timeout_exceeded():
                     logging.info("Timeout exceeded, initiating system shutdown")
+                    self.play_shutdown_melody()
                     self.camera_manager.shutdown_system()
                     # If we reach here, shutdown failed, so stop monitoring
                     break
 
-                # Check every 30 seconds
-                for _ in range(30):
+                # Check often enough to make the 60-second warning useful.
+                for _ in range(5):
                     if self._timeout_stop_event.wait(1):
                         break
 
@@ -1317,6 +1383,61 @@ class CameraSystem:
                 logging.error(f"Error in timeout monitor: {e}")
                 if self._timeout_stop_event.wait(10):
                     break
+
+    def _play_buzzer_pattern(self, pattern, label, blocking=True):
+        """Play a simple on/off pattern on an optional active GPIO buzzer."""
+        if not self.camera_manager.is_shutdown_buzzer_enabled():
+            return
+
+        pin = self.camera_manager.get_shutdown_buzzer_pin()
+
+        def _run():
+            acquired = self._buzzer_lock.acquire(blocking=False)
+            if not acquired:
+                logging.info("Skipping %s buzzer: buzzer already in use", label)
+                return
+            try:
+                import gpiozero
+                buzzer = gpiozero.Buzzer(pin)
+                for on_seconds, off_seconds in pattern:
+                    buzzer.on()
+                    time.sleep(on_seconds)
+                    buzzer.off()
+                    if off_seconds:
+                        time.sleep(off_seconds)
+                buzzer.close()
+                logging.info("%s buzzer sounded on BCM GPIO%s", label, pin)
+            except Exception as e:
+                logging.warning("Could not sound %s buzzer on BCM GPIO%s: %s", label, pin, e)
+            finally:
+                self._buzzer_lock.release()
+
+        if blocking:
+            _run()
+        else:
+            threading.Thread(target=_run, daemon=True).start()
+
+    def play_shutter_click(self):
+        """Make a tiny shutter-like tick when a capture is triggered."""
+        self._play_buzzer_pattern(
+            [(0.025, 0.018), (0.018, 0.0)],
+            "shutter click",
+            blocking=False
+        )
+
+    def play_shutdown_warning_buzzer(self):
+        """Pulse an optional GPIO buzzer without touching the e-paper display."""
+        self._play_buzzer_pattern(
+            [(0.12, 0.10), (0.12, 0.10), (0.12, 0.45), (0.30, 0.0)],
+            "auto-shutdown warning"
+        )
+
+    def play_shutdown_melody(self):
+        """Play a shutdown cadence before halting the Pi."""
+        self._play_buzzer_pattern(
+            [(0.10, 0.06), (0.10, 0.06), (0.18, 0.08), (0.28, 0.10), (0.42, 0.0)],
+            "shutdown"
+        )
 
     def update_activity(self):
         """Update activity time."""
@@ -1731,13 +1852,13 @@ def _create_fastapi_routes():
 
 
 def _start_api_server_in_background(host: str = "127.0.0.1", port: int = 8077):
-
-    app = _create_fastapi_routes()
-    if app is None:
-        logging.warning("FastAPI/uvicorn not available; hardware API will not be started")
-        return
     def _run():
         try:
+            logging.info("Hardware API server initializing in background")
+            app = _create_fastapi_routes()
+            if app is None:
+                logging.warning("FastAPI/uvicorn not available; hardware API will not be started")
+                return
             uvicorn.run(app, host=host, port=port, log_level="warning")
         except Exception as e:
             logging.error(f"Failed to start API server: {e}")
@@ -1763,6 +1884,7 @@ def main():
     startup_status = "Camera initialized; startup capture failed"
     try:
         with _operation_lock:
+            camera_system.play_shutter_click()
             result = camera_system.capture_photo_api(fast_mode=True)
 
         if result.get("success"):
@@ -1785,25 +1907,22 @@ def main():
         _notify_systemd_ready(startup_status)
 
     # ═══════════════════════════════════════════════════════════════
-    # HARDWARE: Button — PiSugar 3 via I2C
-    # The PiSugar 3 exposes a button register at I2C address 0x57.
-    # This is a direct hardware read (no PiSugar library needed).
+    # HARDWARE: Button — direct GPIO (no PiSugar)
+    # A momentary switch is wired between GPIO4 (physical pin 7) and
+    # any GND pin (e.g. physical pin 9). gpiozero's internal pull-up
+    # holds the pin HIGH when idle; the switch pulls it LOW when
+    # pressed. bounce_time gives software debouncing.
+    # NOTE: Without PiSugar there is no hardware power-on/off — you
+    # power the camera by plugging it in, and a long press here no
+    # longer shuts anything down natively (see docs/hardware-porting.md).
     # To use a different button/trigger, replace is_power_button_pressed().
-    # Long press (≥2s) is ignored here — PiSugar handles shutdown natively.
-    # See: https://github.com/PiSugar/PiSugar/wiki/PiSugar-3-I2C-Datasheet
     # ═══════════════════════════════════════════════════════════════
-    I2C_ADDRESS = 0x57
-    BUTTON_REGISTER = 0x02
-    import smbus2
-    bus = smbus2.SMBus(1)
+    import gpiozero
+    BUTTON_PIN = 4
+    shutter_button = gpiozero.Button(BUTTON_PIN, pull_up=True, bounce_time=0.02)
 
     def is_power_button_pressed():
-        try:
-            reg_val = bus.read_byte_data(I2C_ADDRESS, BUTTON_REGISTER)
-            return bool(reg_val & 0x01)  # Check the least significant bit
-        except Exception as e:
-            logging.error("Failed to read I2C: %s", e)
-            return False
+        return shutter_button.is_pressed
 
     prev_state = False
     button_press_start_time = None
@@ -1818,7 +1937,7 @@ def main():
     camera_system.start_dashboard_qr_monitor()
 
     logging.info("System initialized. API server running. Waiting for button press to capture photo...")
-    logging.info(f"Button protection: Long press (>={LONG_PRESS_THRESHOLD}s) will not trigger photo capture")
+    logging.info(f"Button behavior: short press captures; long press (>={LONG_PRESS_THRESHOLD}s) shuts down")
 
     try:
         while True:
@@ -1841,6 +1960,7 @@ def main():
                             logging.info(f"Short press detected ({press_duration:.1f}s) - display busy, ignoring")
                         else:
                             logging.info(f"Short press detected ({press_duration:.1f}s) - capturing photo...")
+                            camera_system.play_shutter_click()
                             with _operation_lock:
                                 result = camera_system.capture_photo_api()
                             if result.get("success"):
@@ -1848,7 +1968,9 @@ def main():
                             else:
                                 logging.error("Capture failed: %s", result.get("message", "unknown error"))
                     else:
-                        logging.info(f"Long press detected ({press_duration:.1f}s) - ignoring for photo capture")
+                        logging.info(f"Long press detected ({press_duration:.1f}s) - shutting down")
+                        camera_system.play_shutdown_melody()
+                        camera_system.camera_manager.shutdown_system()
 
                     button_press_start_time = None
 
@@ -1857,7 +1979,7 @@ def main():
     except KeyboardInterrupt:
         logging.info("Program interrupted by user. Exiting...")
     finally:
-        bus.close()
+        shutter_button.close()
         try:
             # Stop timeout monitor and put display to sleep if initialized inside CameraSystem
             if camera_system:

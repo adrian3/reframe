@@ -63,6 +63,11 @@ sudo apt install -y -qq \
     python3-picamera2 \
     python3-spidev \
     python3-gpiozero \
+    python3-fastapi \
+    python3-uvicorn \
+    python3-aiofiles \
+    python3-httpx \
+    python3-qrcode \
     v4l-utils \
     i2c-tools \
     netcat-openbsd \
@@ -84,66 +89,9 @@ PYTHONNOUSERSITE=1 "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/require
 info "Python packages installed in $VENV_DIR"
 
 # ── 3. PiSugar Power Manager ────────────────
-step "Checking for PiSugar Power Manager"
-
-configure_pisugar() {
-    if ! command -v nc >/dev/null 2>&1; then
-        warn "Cannot configure PiSugar automatically: nc is not installed"
-        return
-    fi
-
-    sudo systemctl start pisugar-server 2>/dev/null || true
-
-    for attempt in 1 2 3 4 5; do
-        if echo "get model" | nc -w 2 -q 0 127.0.0.1 8423 >/dev/null 2>&1; then
-            break
-        fi
-        sleep 1
-    done
-
-    if ! echo "get model" | nc -w 2 -q 0 127.0.0.1 8423 >/dev/null 2>&1; then
-        warn "pisugar-server is installed but not responding on port 8423"
-        warn "After it starts, run: echo 'set_anti_mistouch false' | nc -q 0 127.0.0.1 8423"
-        return
-    fi
-
-    if echo "set_anti_mistouch false" | nc -w 2 -q 0 127.0.0.1 8423 | grep -qi "done"; then
-        info "Disabled PiSugar anti-mistouch so one press powers on the camera"
-    else
-        warn "Could not disable PiSugar anti-mistouch automatically"
-        warn "Manual command: echo 'set_anti_mistouch false' | nc -q 0 127.0.0.1 8423"
-    fi
-}
-
-install_pisugar_power_manager() {
-    local installer="/tmp/pisugar-power-manager.sh"
-
-    info "Installing PiSugar Power Manager"
-    wget -q -O "$installer" https://cdn.pisugar.com/release/pisugar-power-manager.sh
-    bash "$installer" -c release
-}
-
-if systemctl list-unit-files | grep -q pisugar-server; then
-    info "pisugar-server is already installed"
-    configure_pisugar
-else
-    warn "pisugar-server not found"
-    echo ""
-    echo "  The PiSugar 3 requires pisugar-server for battery monitoring,"
-    echo "  power management, and one-press power-on configuration."
-    echo "  The official PiSugar installer may ask you to select a model."
-    echo "  Choose 'PiSugar 3' when prompted."
-    echo ""
-
-    install_pisugar_power_manager
-
-    if systemctl list-unit-files | grep -q pisugar-server; then
-        configure_pisugar
-    else
-        warn "PiSugar installer finished, but pisugar-server was not found"
-        warn "Manual install: https://github.com/PiSugar/PiSugar/wiki/PiSugar-3-Series"
-    fi
-fi
+step "Skipping PiSugar Power Manager (this build powers the Pi directly)"
+warn "No PiSugar installed — battery monitoring and hardware power-on/shutdown are unavailable"
+warn "Photo capture uses a button wired directly to GPIO4 instead"
 
 # ── 4. Enable hardware interfaces ───────────
 step "Enabling hardware interfaces"
@@ -152,12 +100,16 @@ step "Enabling hardware interfaces"
 sudo raspi-config nonint do_spi 0
 info "SPI enabled"
 
-if ! grep -q "^camera_auto_detect=1" "$BOOT_CONFIG" 2>/dev/null; then
-    echo "camera_auto_detect=1" | sudo tee -a "$BOOT_CONFIG" > /dev/null
-    info "Camera auto-detect enabled in $BOOT_CONFIG"
+if grep -q "^camera_auto_detect=" "$BOOT_CONFIG" 2>/dev/null; then
+    sudo sed -i "s|^camera_auto_detect=.*|camera_auto_detect=0|" "$BOOT_CONFIG"
 else
-    info "Camera auto-detect already enabled"
+    echo "camera_auto_detect=0" | sudo tee -a "$BOOT_CONFIG" > /dev/null
 fi
+sudo sed -i "/^dtoverlay=imx708$/d" "$BOOT_CONFIG"
+if ! grep -q "^dtoverlay=imx219$" "$BOOT_CONFIG" 2>/dev/null; then
+    echo "dtoverlay=imx219" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+fi
+info "Configured Raspberry Pi Camera Module V2 overlay (imx219) in $BOOT_CONFIG"
 
 # ── 5. Boot-speed hardware trims ────────────
 step "Applying boot-speed hardware trims"
@@ -230,6 +182,9 @@ chmod +x "$SCRIPT_DIR/scripts/enable_hdr.sh"
 chmod +x "$SCRIPT_DIR/scripts/reframe-python"
 info "Runtime scripts marked executable"
 
+chmod +x "$SCRIPT_DIR/reframe-wait-camera"
+info "reframe-wait-camera marked executable"
+
 # Install the narrow privileged helper used after dashboard git updates.
 sudo install -o root -g root -m 0755 "$SCRIPT_DIR/scripts/reframe-apply-update" /usr/local/sbin/reframe-apply-update
 echo "cam ALL=(root) NOPASSWD: /usr/local/sbin/reframe-apply-update" | sudo tee /etc/sudoers.d/reframe-update-helper > /dev/null
@@ -274,6 +229,13 @@ sudo cp "$SCRIPT_DIR/systemd/reframe-dashboard-proxy.service" /etc/systemd/syste
 sudo chmod 644 /etc/systemd/system/reframe-dashboard-proxy.service
 info "Installed reframe-dashboard-proxy.service"
 
+# Install optional WiFi preference helper. It only takes effect when a
+# NetworkManager connection named iphone-hotspot has already been configured.
+sudo install -o root -g root -m 0755 "$SCRIPT_DIR/reframe-prefer-phone-wifi" /usr/local/bin/reframe-prefer-phone-wifi
+sudo cp "$SCRIPT_DIR/reframe-prefer-phone-wifi.service" /etc/systemd/system/reframe-prefer-phone-wifi.service
+sudo chmod 644 /etc/systemd/system/reframe-prefer-phone-wifi.service
+info "Installed reframe-prefer-phone-wifi.service"
+
 # Reload and enable
 sudo systemctl daemon-reload
 sudo systemctl reenable reframe.service
@@ -281,6 +243,7 @@ sudo systemctl enable reframe-dashboard.service
 sudo systemctl enable reframe-dashboard-proxy.service
 sudo systemctl enable reframe-rtc-restore.service
 sudo systemctl enable reframe-rtc-update.service
+sudo systemctl enable reframe-prefer-phone-wifi.service
 info "Services enabled (will start on boot)"
 
 # ── 10. Boot-speed service trims ─────────────
